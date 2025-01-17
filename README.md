@@ -17,7 +17,8 @@ ___
 ![1736805654767](https://github.com/user-attachments/assets/d00ad209-54af-4d9c-8f4b-2b048c71717a)
 
 ---
-**Invoke-NewGPO.ps1**: Creates a new empty GPO and links it to the target OU, assuming you have enough privileges. (works like a charm with membership in `Group Policy Creator Owners` or anything equally powerful)
+**Invoke-NewGPO.ps1**: Creates a new empty GPO and links it to the target OU, assuming you have enough privileges. (works like a charm with membership in `Group Policy Creator Owners` or anything equally powerful).
+Keep in mind that you still need privilege to link the GPO. Linking GPOs is an OU-specific permission, creating GPOs is a domain wide permission.
 
 ![1736274316707](https://github.com/user-attachments/assets/68912d4f-3406-4bdb-9ff2-2ddebf17d823)
 
