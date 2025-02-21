@@ -1,5 +1,7 @@
-# toolBox
+# CTF toolBox
 PowerShell &amp; Python tools developed for CTFs and certification exams
+
+(Too lazy to keep maintaining these scripts for long, feel free to edit/fix/customize as you please)
 ___
 
 **certInfo.ps1**: Displays information about a cert file
@@ -24,6 +26,17 @@ Keep in mind that you still need privilege to link the GPO. Linking GPOs is an O
 
 ---
 
-**Read-FileWithSeBackupPrivilege.ps1**: Uses SeBackupPrivilege to read files/flags. (Doesn't have functionality to move files between directories)
+**Read-FileWithSeBackupPrivilege**: Uses SeBackupPrivilege to read files/flags.
 
 ![1735424866984](https://github.com/user-attachments/assets/676cf7ab-59e8-4a4c-aee7-122adef64e66)
+
+
+**Copy-FileWithSeBackupPrivilege**: Uses SeBackupPrivilege to copy files.
+
+
+![image](https://github.com/user-attachments/assets/3170d958-ddb8-49e5-b9f3-63a4184805c9)
+
+---
+**raiseChild.ps1**: PowerShell version of Impacket's `raiseChild.py` - automates Child domain -> Parent domain compromise.
+
+![image](https://github.com/user-attachments/assets/f70a80c1-9eab-4130-a9b1-31510304355b)
