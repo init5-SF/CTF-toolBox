@@ -246,6 +246,40 @@ public class RpcDump
         }
     }
 
+    function Get-WSUSConfiguration {
+        Print-SectionHeader "WSUS Configuration Check"
+    
+        $regPath = "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate"
+        
+        try {
+            # Check if the registry path exists
+            if (Test-Path $regPath) {
+                $wuServer = Get-ItemProperty -Path $regPath -Name "WUServer" -ErrorAction SilentlyContinue
+                
+                if ($wuServer -and $wuServer.WUServer) {
+                    Write-Host "WSUS Server detected:" -ForegroundColor Yellow
+                    Write-Host "WUServer: $($wuServer.WUServer)" -ForegroundColor Green
+                    
+                    # Check for additional relevant values
+                    $wuStatusServer = Get-ItemProperty -Path $regPath -Name "WUStatusServer" -ErrorAction SilentlyContinue
+                    if ($wuStatusServer -and $wuStatusServer.WUStatusServer) {
+                        Write-Host "WUStatusServer: $($wuStatusServer.WUStatusServer)" -ForegroundColor Green
+                    }
+                }
+                else {
+                    Write-Host "No WSUS server configured in registry (WUServer value not found)."
+                }
+            }
+            else {
+                Write-Host "WindowsUpdate registry key not found. WSUS likely not configured via Group Policy."
+            }
+        }
+        catch {
+            Write-Host "Error checking WSUS configuration: $_" -ForegroundColor Red
+        }
+        
+        Write-Host " "
+    }
     function Get-EnterpriseCA {
         param (
             [System.DirectoryServices.DirectoryEntry]$Connection,
@@ -695,8 +729,8 @@ public class RpcDump
             [System.DirectoryServices.DirectoryEntry]$Connection,
             [string]$BaseDN
         )
-        $excludedEntities = 'NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators', 'BUILTIN\Account Operators', 'S-1-5-32-548'
-        $domainPrefixedEntities = 'Domain Admins', 'Enterprise Admins', 'exchange trusted subsystem', 'organization management', 'exchange windows permissions'
+        $excludedEntities = 'NT AUTHORITY\SYSTEM', 'NT AUTHORITY\SELF', 'BUILTIN\Administrators', 'BUILTIN\Account Operators', 'S-1-5-32-548'
+        $domainPrefixedEntities = 'Domain Admins', 'Enterprise Admins', 'exchange trusted subsystem', 'organization management', 'exchange windows permissions', 'Cert Publishers', 'Enterprise Key Admins', 'Key Admins'
 
         # Filter out MSA and GMSA accounts
         $computerSearch = [adsisearcher]"(&(objectClass=computer)(!(objectClass=msDS-ManagedServiceAccount))(!(objectClass=msDS-GroupManagedServiceAccount)))"
@@ -728,7 +762,7 @@ public class RpcDump
                 $isExcluded = $excludedEntities -contains $identity -or $domainPrefixedEntities -contains $identity.Split('\')[-1]
 
                 # Exclude Account Operators and other excluded entities
-                if ($ace.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteDacl|WriteOwner|WriteAccountRestrictions|AllowedToAct' -and -not $isExcluded) {
+                if ($ace.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteDacl|WriteProperty|WriteOwner|WriteAccountRestrictions|AllowedToAct' -and -not $isExcluded) {
                     if (-not $permissions.ContainsKey($identity)) { $permissions[$identity] = @() }
                     $permissions[$identity] += $ace.ActiveDirectoryRights
                 }
@@ -738,7 +772,8 @@ public class RpcDump
                 Write-Host "[!] Computer object:" 
                 Write-Host "$($computer.Properties["name"][0])" -ForegroundColor Yellow
                 Write-Host "[!] Users with permissions:" 
-                foreach ($user in $permissions.Keys) { Write-Host "$user -> $($permissions[$user] -join ', ')" -ForegroundColor Yellow }
+                foreach ($user in $permissions.Keys) { Write-Host "$user -> $(($permissions[$user] | Select-Object -Unique) -join ', ')" -ForegroundColor Yellow }
+
                 Write-Host " "
             }
         }
@@ -778,7 +813,7 @@ public class RpcDump
         Get-DomainInfo -Connection $connection -BaseDN $baseDN
         Get-EnterpriseCA -Connection $connection -ConfigNC $configNC
         List-SCCMInstances -Connection $connection -BaseDN $baseDN
-
+        Get-WSUSConfiguration
         # List other objects
         List-Users -Connection $connection -BaseDN $baseDN
         List-Computers -Connection $connection -BaseDN $baseDN
