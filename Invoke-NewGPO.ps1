@@ -1,44 +1,11 @@
-﻿Function Invoke-NewGPO {
+Function Invoke-NewGPO {
     param (
         [Parameter(Mandatory = $true)]
         [string]$Domain, # Domain name (e.g., bank.local)
 
         [Parameter(Mandatory = $true)]
-        [string]$GPOName, # Name of the GPO to create
-
-        [Parameter(Mandatory = $true)]
-        [string]$TargetOUDN # Distinguished name of the target OU or domain (e.g., OU=testOU,DC=bank,DC=local)
+        [string]$GPOName # Name of the GPO to create
     )
-
-    # Validate the $TargetOUDN format
-    if ($TargetOUDN -notmatch '^OU=[^,]+,DC=[^,]+,DC=[^,]+$') {
-        Write-Host "Invalid TargetOUDN format. Expected format: OU=YourOU,DC=domain,DC=com" -ForegroundColor Red
-        break
-    }
-
-    # Step 0: Check if the target OU exists
-    try {
-        # Attempt to bind to the target OU
-        $targetOu = [ADSI]"LDAP://$TargetOUDN"
-        # Check if the Properties collection is accessible
-        if ($null -eq $targetOu.Properties) {
-            throw "The target OU '$TargetOUDN' does not exist. Please verify the distinguished name (DN)."
-            break
-        }
-
-        # Check if the 'name' property exists
-        if (-not $targetOu.Properties.Contains('name')) {
-            throw "The target OU '$TargetOUDN' does not exist. Please verify the distinguished name (DN)."
-            break
-        }
-
-        # Debug: Display the OU name to confirm it exists
-        Write-Host "Target OU exists: $($targetOu.Properties['name'].Value)" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "Failed to verify the target OU: $_" -ForegroundColor Red
-        break
-    }
 
     # Define SYSVOL path and generate GUID for the GPO
     $sysvolPath = "\\$Domain\SYSVOL\$Domain\Policies"
@@ -65,7 +32,7 @@
     }
     catch {
         Write-Host "Failed to create GPO: $_" -ForegroundColor Red
-        break
+        return $null
     }
 
     # Step 2: Create the SYSVOL folder for the GPO (GPT part)
@@ -99,7 +66,7 @@ Version=0
     }
     catch {
         Write-Host "Failed to create SYSVOL folder or files: $_" -ForegroundColor Red
-        break
+        return $null
     }
 
     # Step 3: Create the Machine and User folders in the GPC part (AD)
@@ -117,7 +84,7 @@ Version=0
     }
     catch {
         Write-Host "Failed to create Machine or User folders in AD: $_" -ForegroundColor Red
-        break
+        return $null
     }
 
     # Step 4: Set permissions for the GPO folder to match GPMC
@@ -133,6 +100,7 @@ Version=0
         $enterpriseAdminsSid = ([System.Security.Principal.NTAccount]"$Domain\Enterprise Admins").Translate([System.Security.Principal.SecurityIdentifier])
         $myself = whoami
         $mySid = ([System.Security.Principal.NTAccount]"$myself").Translate([System.Security.Principal.SecurityIdentifier])
+        
         # Set permissions on the parent policy folder
         $gpoFolderAcl = Get-Acl -Path $gpoFolderPath
 
@@ -196,10 +164,78 @@ Version=0
     }
     catch {
         Write-Host "Failed to set permissions for GPO folder: $_" -ForegroundColor Red
+        return $null
+    }
+
+    # Return the GPO DN for linking
+    return $gpoDn
+}
+
+Function Invoke-GPOLink {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$GPOName, # Name of the GPO to link
+
+        [Parameter(Mandatory = $true)]
+        [string]$TargetOUDN, # Distinguished name of the target OU or domain (e.g., OU=testOU,DC=bank,DC=local)
+
+        [Parameter(Mandatory = $false)]
+        [string]$Domain # Optional domain name (e.g., bank.local)
+    )
+
+    # Validate the $TargetOUDN format
+    if ($TargetOUDN -notmatch '^(OU=[^,]+,)*(DC=[^,]+,)*DC=[^,]+$|^CN=[^,]+,CN=Sites,CN=Configuration,(DC=[^,]+,)*DC=[^,]+$') {
+        Write-Host "Invalid TargetOUDN format. Expected format: Distinguished Name of Domain/OU/AD Site" -ForegroundColor Red
         break
     }
 
-    # Step 5: Link the GPO to the target OU or domain
+    # Step 0: Check if the target OU exists
+    try {
+        # Attempt to bind to the target OU
+        $targetOu = [ADSI]"LDAP://$TargetOUDN"
+        # Check if the Properties collection is accessible
+        if ($null -eq $targetOu.Properties) {
+            throw "The target '$TargetOUDN' does not exist. Please verify the distinguished name (DN)."
+        }
+
+        # Check if the 'name' property exists
+        if (-not $targetOu.Properties.Contains('name')) {
+            throw "The target '$TargetOUDN' does not exist. Please verify the distinguished name (DN)."
+        }
+
+        # Debug: Display the OU name to confirm it exists
+        Write-Host "Target exists: $($targetOu.Properties['name'].Value)" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Failed to verify the target: $_" -ForegroundColor Red
+        break
+    }
+
+    # Step 1: Find the GPO by name
+    try {
+        if (-not $Domain) {
+            # Extract domain from TargetOUDN if not provided
+            $Domain = ($TargetOUDN -split ',' | Where-Object { $_ -match '^DC=' }) -replace '^DC=' -join '.'
+        }
+
+        $policiesContainer = [ADSI]"LDAP://CN=Policies,CN=System,DC=$($Domain -replace '\.', ',DC=')"
+        $searcher = New-Object DirectoryServices.DirectorySearcher($policiesContainer)
+        $searcher.Filter = "(&(objectClass=groupPolicyContainer)(displayName=$GPOName))"
+        $result = $searcher.FindOne()
+
+        if (-not $result) {
+            Write-Host "GPO '$GPOName' not found in domain $Domain" -ForegroundColor Red
+            break
+        }
+
+        $gpoDn = $result.Properties["distinguishedName"][0]
+    }
+    catch {
+        Write-Host "Failed to find GPO: $_" -ForegroundColor Red
+        break
+    }
+
+    # Step 2: Link the GPO to the target OU or domain
     try {
         # Get the target OU
         $targetOu = [ADSI]"LDAP://$TargetOUDN"
@@ -222,13 +258,14 @@ Version=0
         }
 
         # Update the gPLink attribute
-        $targetOu.Properties["gPLink"].Clear()  # Clear the existing gPLink value
-        $targetOu.Properties["gPLink"].Add($newGpLinks)  # Add the new gPLink value
+        $targetOu.Properties["gPLink"].Clear() >$null 2>&1 # Clear the existing gPLink value
+        $targetOu.Properties["gPLink"].Add($newGpLinks) >$null 2>&1 # Add the new gPLink value
         $targetOu.SetInfo()
-        Write-Host "GPO '$GPOName' linked to OU: $TargetOUDN" -ForegroundColor Green
+        Write-Host "GPO '$GPOName' linked to target: $TargetOUDN" -ForegroundColor Green
+        #return $true
     }
     catch {
-        Write-Host "Failed to link GPO to OU: $_" -ForegroundColor Red
+        Write-Host "Failed to link GPO to target: $_" -ForegroundColor Red
         break
     }
 }
