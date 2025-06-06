@@ -503,15 +503,91 @@ public class RpcDump
             [System.DirectoryServices.DirectoryEntry]$Connection,
             [string]$BaseDN
         )
-        $constrainedDelegationSearch = [adsisearcher]"(msDS-AllowedToDelegateTo=*)"
-        $constrainedDelegationSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
-        $constrainedDelegationSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "userPrincipalName", "distinguishedName", "msDS-AllowedToDelegateTo"))
-        $constrainedDelegationAccounts = $constrainedDelegationSearch.FindAll()
-
+    
         Print-SectionHeader "Accounts with Constrained Delegation"
-        foreach ($account in $constrainedDelegationAccounts) {
-            Write-Host "Account: $($account.Properties['sAMAccountName'][0])"
-            Write-Host "Allowed to Delegate To: $($account.Properties['msDS-AllowedToDelegateTo'][0])"
+    
+        try {
+            # First get all computer accounts in the domain for SPN validation
+            $allComputers = @{}
+            $computerSearch = [adsisearcher]"(&(objectClass=computer))"
+            $computerSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+            $computerSearch.PropertiesToLoad.AddRange(@("dNSHostName", "servicePrincipalName"))
+            $computerResults = $computerSearch.FindAll()
+        
+            foreach ($computer in $computerResults) {
+                if ($computer.Properties['dNSHostName'] -and $computer.Properties['dNSHostName'][0]) {
+                    $computerName = $computer.Properties['dNSHostName'][0]
+                    $allComputers[$computerName] = $true
+                
+                    # Also add the computer name without domain for matching
+                    if ($computerName -match "^([^\.]+)\.") {
+                        $allComputers[$matches[1]] = $true
+                    }
+                }
+            
+                # Add any SPNs for this computer
+                if ($computer.Properties['servicePrincipalName']) {
+                    foreach ($spn in $computer.Properties['servicePrincipalName']) {
+                        if ($spn -match "^[^/]+/([^/]+)") {
+                            $allComputers[$matches[1]] = $true
+                        }
+                    }
+                }
+            }
+
+            # Now find all accounts with constrained delegation
+            $constrainedDelegationSearch = [adsisearcher]"(msDS-AllowedToDelegateTo=*)"
+            $constrainedDelegationSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+            $constrainedDelegationSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "msDS-AllowedToDelegateTo"))
+            $constrainedDelegationAccounts = $constrainedDelegationSearch.FindAll()
+
+            foreach ($account in $constrainedDelegationAccounts) {
+                $accountName = $account.Properties['sAMAccountName'][0]
+                $delegateTo = $account.Properties['msDS-AllowedToDelegateTo']
+            
+                if (-not $delegateTo -or $delegateTo.Count -eq 0) {
+                    continue
+                }
+
+                Write-Host "Account: $accountName" -ForegroundColor Yellow
+                Write-Host "Allowed to Delegate To:"
+            
+                $orphanedSPNs = @()
+            
+                foreach ($target in $delegateTo) {
+                    if (-not $target) { continue }
+                
+                    # Extract the target server name from the SPN (format is usually service/host)
+                    $targetServer = $target -replace "^[^/]+/([^/:]+).*", '$1'
+                
+                    # Check if the target exists in our computer list
+                    $isOrphaned = $true
+                
+                    # Check different variations of the target name
+                    if ($allComputers.ContainsKey($targetServer)) {
+                        $isOrphaned = $false
+                    }
+                    else {
+                        # If it's a FQDN, check the base computer name
+                        $shortName = $targetServer.Split('.')[0]
+                        if ($allComputers.ContainsKey($shortName)) {
+                            $isOrphaned = $false
+                        }
+                    }
+                
+                    if ($isOrphaned) {
+                        Write-Host "  - $target [ORPHANED]" -ForegroundColor Red
+                        $orphanedSPNs += $target
+                    }
+                    else {
+                        Write-Host "  - $target" -ForegroundColor Green
+                    }
+                }
+                Write-Host "`n"
+            }
+        }
+        catch {
+            Write-Host "Error in List-ConstrainedDelegationAccounts: $_" -ForegroundColor Red
         }
     }
 
@@ -772,6 +848,7 @@ public class RpcDump
                 Write-Host "[!] Computer object:" 
                 Write-Host "$($computer.Properties["name"][0])" -ForegroundColor Yellow
                 Write-Host "[!] Users with permissions:" 
+                #foreach ($user in $permissions.Keys) { Write-Host "$user -> $($permissions[$user] -join ', ')" -ForegroundColor Yellow }
                 foreach ($user in $permissions.Keys) { Write-Host "$user -> $(($permissions[$user] | Select-Object -Unique) -join ', ')" -ForegroundColor Yellow }
 
                 Write-Host " "
