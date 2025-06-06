@@ -165,7 +165,7 @@ if ($createChild -ne $null) {
 
 }
 else {
-    write-host "   |_ [None found]"
+    write-host "|  |_ [None found]"
 }
 Write-Host "|"
 Write-Host "|_ GenericAll permissions over Policies container" -foregroundcolor yellow
