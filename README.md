@@ -4,6 +4,12 @@ PowerShell &amp; Python tools developed for CTFs and certification exams
 (Too lazy to keep maintaining these scripts for long, feel free to edit/fix/customize as you please)
 ___
 
+**Find-GPOAbuse.ps1**: Displays various GPO misconfigurations and abuse vectors (Relies on PowerView)
+
+![gpo1](https://github.com/user-attachments/assets/81180227-deba-40cc-9e02-7d8db9a1e74e)
+![gpo2](https://github.com/user-attachments/assets/baa4d1f7-4b25-4c6d-ac90-e8eb91d958e3)
+
+---
 **certInfo.ps1**: Displays information about a cert file
 
 ![certInfo](https://github.com/user-attachments/assets/d881e812-124b-479e-9c18-50f805fef285)
