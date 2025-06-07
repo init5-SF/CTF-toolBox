@@ -1,8 +1,17 @@
 #- Made for HTB' CAPE path
 #- Don't forget to import PowerView.ps1 first
 
-
-$dom = (Get-Domain).name
+try {
+    $dom = (Get-Domain).name
+}
+catch [System.Management.Automation.CommandNotFoundException] {
+    # Check if the error message specifically mentions 'Get-Domain'
+    if ($_.Exception.Message -like "*The term 'Get-Domain' is not recognized*") {
+        Write-Host "[!] Error: Make sure PowerView is loaded" -foregroundcolor Red
+        Write-Host " "
+        break
+    }
+}
 
 function Test-SYSVOLWritePermissions {
     param (
@@ -62,6 +71,7 @@ function Get-GPLinkStatus {
     }
     return $null
 }
+Write-Host " "
 Write-Host "-------- Vulnerable GPOs Scan:" -ForegroundColor Green
 # Process each result
 $results | ForEach-Object {
