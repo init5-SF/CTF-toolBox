@@ -4,6 +4,20 @@
 
 import argparse
 from ldap3 import Server, Connection, ALL, NTLM
+import requests
+
+# Color aliases
+RESET = "\033[0m"
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+WHITE = "\033[97m"
+BOLD = "\033[1m"
+UNDERLINE = "\033[4m"
+
 
 
 def ldap_search(connection, base_dn, filter_str, attributes=None):
@@ -20,17 +34,18 @@ def print_section_header(header):
     centered_header = header.center(width)
     # Print the header with centered text
     print("\n" + "-" * width)
-    print(f"\033[1m{centered_header}\033[0m")  # \033[1m for bold, \033[0m to reset formatting
+    print(f"{CYAN}{centered_header}{RESET}")
     print("-" * width)
 
 
 def get_domain_info(connection, base_dn):
     # Query RootDSE for domain and forest information
-    connection.search(base_dn, '(objectClass=domain)', attributes=['name', 'objectSid', 'distinguishedName'])
+    connection.search(base_dn, '(objectClass=domain)', attributes=['name', 'objectSid', 'distinguishedName', 'ms-DS-MachineAccountQuota'])
     if connection.entries:
         domain_name = connection.entries[0]['name'].value
         domain_sid = connection.entries[0]['objectSid'].value
         domain_dn = connection.entries[0]['distinguishedName'].value
+        machine_account_quota = connection.entries[0]['ms-DS-MachineAccountQuota'].value if 'ms-DS-MachineAccountQuota' in connection.entries[0] else "N/A"
 
         # Extract the FQDN from the distinguishedName
         fqdn = domain_dn.replace("DC=", "").replace(",", ".")
@@ -38,7 +53,8 @@ def get_domain_info(connection, base_dn):
         print_section_header("Domain Info")
         print(f"Domain Name: {fqdn}")
         print(f"Domain SID: {domain_sid}")
-        return domain_sid  # Return the domain SID for later use
+        print(f"Machine Account Quota: {RED + str(machine_account_quota) + RESET if machine_account_quota > 0 else machine_account_quota}")
+        return domain_sid
     else:
         print("Domain information not found.")
         return None
@@ -49,14 +65,36 @@ def get_enterprise_ca(connection, config_nc):
     print_section_header("ADCS Info")
     ca_search_base = f"CN=Enrollment Services,CN=Public Key Services,CN=Services,{config_nc}"
     connection.search(ca_search_base, '(objectClass=pKIEnrollmentService)', attributes=['name', 'dNSHostName'])
+    
     if connection.entries:
         for entry in connection.entries:
             ca_name = entry['name'].value
             ca_hostname = entry['dNSHostName'].value if 'dNSHostName' in entry else "N/A"
             print(f"Enterprise CA: {ca_hostname}\\{ca_name}")
-#           print(f"Hostname: {ca_hostname}")
+            
+            # Check for web enrollment
+            if ca_hostname != "N/A":
+                try:
+                    url = f"http://{ca_hostname}/certsrv"
+                    response = requests.get(url, timeout=5, allow_redirects=False)
+                    
+                    if response.status_code in (200, 401):
+                        print(f"{GREEN}Web Enrollment: RUNNING (HTTP {response.status_code}){RESET}")
+                        print(f"{RED}Relay URL: {url}/certfnsh.asp{RESET}")
+                        
+                        # Check for NTLM authentication support
+                        if 'WWW-Authenticate' in response.headers and 'NTLM' in response.headers['WWW-Authenticate']:
+                            print(f"{RED}NTLM Authentication: ENABLED{RESET}")
+                        else:
+                            print("NTLM Authentication: DISABLED")
+                    #else:
+                        #print(f"Web Enrollment is NOT running (HTTP {response.status_code})")
+                        
+                except requests.exceptions.RequestException as e:
+                    print(f"{YELLOW}Could not check Web Enrollment: {e}{RESET}")
     else:
         print("Enterprise CA not found.")
+
 
 
 def list_users(connection, base_dn):
@@ -108,12 +146,17 @@ def list_managed_service_accounts(connection, base_dn):
 
 def list_domain_controllers(connection, base_dn):
     filter_str_dc = "(userAccountControl:1.2.840.113556.1.4.803:=8192)"
-    attributes_dc = ['sAMAccountName', 'distinguishedName']
+    attributes_dc = ['sAMAccountName', 'distinguishedName', 'operatingSystem', 'operatingSystemVersion']
     dcs = ldap_search(connection, base_dn, filter_str_dc, attributes_dc)
 
     print_section_header("Domain Controllers")
     for dc in dcs:
-        print(f"Domain Controller: {dc['sAMAccountName'].value}, DN: {dc['distinguishedName'].value}")
+        os_name = dc['operatingSystem'].value if 'operatingSystem' in dc else "Unknown OS"
+        os_version = dc['operatingSystemVersion'].value if 'operatingSystemVersion' in dc else "Unknown Version"
+        print(f"Domain Controller: {dc['sAMAccountName'].value}")
+        print(f"Operating System: {os_name} ({os_version})")
+        print(f"DN: {dc['distinguishedName'].value}")
+        print(" ")  # Add blank line for readability
 
 
 def list_kerberoastable_users(connection, base_dn):
@@ -204,9 +247,31 @@ def list_constrained_delegation_accounts(connection, base_dn):
     constrained_delegation_accounts = ldap_search(connection, base_dn, filter_str_constrained_delegation, attributes_constrained_delegation)
 
     print_section_header("Accounts with Constrained Delegation")
+    
+    # First get all computer names in the domain for SPN validation
+    computers = set()
+    connection.search(base_dn, "(objectClass=computer)", attributes=['sAMAccountName'])
+    for computer in connection.entries:
+        computers.add(computer['sAMAccountName'].value.rstrip('$').upper())
+
     for account in constrained_delegation_accounts:
-        print(f"Account: {account['sAMAccountName'].value}")
-        print(f"Allowed to Delegate To: {account['msDS-AllowedToDelegateTo'].value}")
+        print(f"Account: {YELLOW}{account['sAMAccountName'].value}{RESET}")
+        print(f"Allowed to Delegate To:")
+        
+        for spn in account['msDS-AllowedToDelegateTo'].values:
+            # Parse the SPN to get the target computer name
+            try:
+                service, target = spn.split('/', 1)
+                computer_name = target.split('.')[0].upper() + "$"  # Add $ to match AD format
+                
+                # Check if computer exists
+                if computer_name.rstrip('$').upper() in computers:
+                    print(f"  {GREEN}{spn}{RESET} (Valid)")
+                else:
+                    print(f"  {RED}{spn}{RESET} {YELLOW}(ORPHANED){RESET}")
+            except:
+                print(f"  {spn} (Malformed SPN)")
+        print(" ")  # Add blank line between accounts
 #        print(f" ")
 
 
@@ -231,9 +296,9 @@ def list_accounts_with_password_attributes(connection, base_dn):
     for account in accounts_with_password_attributes:
         print(f"Account: {account['sAMAccountName'].value}, UPN: {account['userPrincipalName'].value}, DN: {account['distinguishedName'].value}")
         if 'unixUserPassword' in account:
-            print(f"unixUserPassword: {account['unixUserPassword'].value}")
+            print(f"{RED}unixUserPassword: {account['unixUserPassword'].value}{RESET}")
         if 'userPassword' in account:
-            print(f"userPassword: {account['userPassword'].value}")
+            print(f"{RED}userPassword: {account['userPassword'].value}{RESET}")
         print(f" ")
 
 
