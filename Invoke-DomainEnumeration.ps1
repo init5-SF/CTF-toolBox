@@ -244,6 +244,17 @@ public class RpcDump
         else {
             Write-Host "Domain SID: [Not available]"
         }
+    
+        # Get ms-DS-MachineAccountQuota value
+        $machineAccountQuota = $domain.Properties['ms-DS-MachineAccountQuota'][0]
+        if ($machineAccountQuota -ne $null) {
+
+            if ($machineAccountQuota -gt 0) { Write-Host "Machine Account Quota: $machineAccountQuota " -ForegroundColor Red }
+            else { Write-Host "Machine Account Quota: $machineAccountQuota " }
+        }
+        else {
+            Write-Host "Machine Account Quota: [Not available]"
+        }
     }
 
     function Get-WSUSConfiguration {
@@ -288,15 +299,139 @@ public class RpcDump
         $caSearchBase = "CN=Enrollment Services,CN=Public Key Services,CN=Services,$ConfigNC"
         $caSearch = [adsisearcher]"(&(objectClass=pKIEnrollmentService))"
         $caSearch.SearchRoot = [adsi]"LDAP://$DC/$caSearchBase"
-        $caSearch.PropertiesToLoad.AddRange(@("name", "dNSHostName"))  # Add dNSHostName to the properties to load
+        $caSearch.PropertiesToLoad.AddRange(@("name", "dNSHostName", "cn"))  # Added cn for CA name
         $cas = $caSearch.FindAll()
-    
+
         Print-SectionHeader "ADCS Info"
         if ($cas.Count -gt 0) {
             foreach ($ca in $cas) {
                 $caName = $ca.Properties['name'][0]
-                $caServer = $ca.Properties['dNSHostName'][0]  # Get the server name (FQDN)
-                Write-Host "Enterprise CA: $caServer\$caName"
+                $caServer = $ca.Properties['dNSHostName'][0]
+                $caCN = $ca.Properties['cn'][0]
+    
+                Write-Host "Enterprise CA: $caServer\$caName" -ForegroundColor Yellow
+                Write-Host "- CA Common Name: $caCN"
+    
+                # Check if web enrollment is running
+                $webEnrollmentUrl = "http://$caServer/certsrv"
+                try {
+                    $request = [System.Net.WebRequest]::Create($webEnrollmentUrl)
+                    $request.Method = "HEAD"  # Use HEAD to only fetch headers
+                    $request.Timeout = 5000  # 5 second timeout
+        
+                    try {
+                        $response = $request.GetResponse()
+                        $statusCode = [int]$response.StatusCode
+                
+                        # Check for NTLM authentication header
+                        $ntlmAuthEnabled = $false
+                        $authHeaders = $response.Headers["WWW-Authenticate"]
+                        if ($authHeaders -match "NTLM") {
+                            $ntlmAuthEnabled = $true
+                        }
+                
+                        $response.Close()
+            
+                        if ($statusCode -eq 200 -or $statusCode -eq 401) {
+                            Write-Host "- [!] Web Enrollment: RUNNING (HTTP $statusCode)" -ForegroundColor Green
+                            Write-Host "- [!] Relay URL: $webEnrollmentUrl/certfnsh.asp" -ForegroundColor Red
+                    
+                            # Report NTLM auth status
+                            if ($ntlmAuthEnabled) {
+                                Write-Host "- [!] NTLM Authentication: ENABLED (Vulnerable to Relay)" -ForegroundColor Red
+                            }
+                            else {
+                                Write-Host "- [!] NTLM Authentication: DISABLED" -ForegroundColor Green
+                            }
+                        }
+                    }
+                    catch [System.Net.WebException] {
+                        $statusCode = [int]$_.Exception.Response.StatusCode
+                        $authHeaders = $_.Exception.Response.Headers["WWW-Authenticate"]
+                        $ntlmAuthEnabled = $authHeaders -match "NTLM"
+                
+                        if ($statusCode -eq 401) {
+                            Write-Host "- [!] Web Enrollment: RUNNING (HTTP $statusCode)" -ForegroundColor Green
+                            Write-Host "- [!] Relay URL: $webEnrollmentUrl/certfnsh.asp" -ForegroundColor Red
+                    
+                            if ($ntlmAuthEnabled) {
+                                Write-Host "- [!] NTLM Authentication: ENABLED (Vulnerable to Relay)" -ForegroundColor Red
+                            }
+                            else {
+                                Write-Host "- [!] NTLM Authentication: DISABLED" -ForegroundColor Green
+                            }
+                        }
+                    }
+                }
+                catch {
+                    # Silently handle other errors (e.g., inaccessible servers)
+                }
+
+                # New: Check CA Security permissions
+                try {
+                    $CASecurity = certutil.exe -config "$caServer\$caName" -getreg "CA\Security" 2>&1 | Out-String
+                
+                    $defaultGroups = @(
+                        "NT AUTHORITY\Authenticated Users",
+                        "BUILTIN\Administrators",
+                        "$($domainName.Split('.')[0])\Domain Admins",
+                        "$($domainName.Split('.')[0])\Enterprise Admins"
+                    )
+                
+                    $permissions = @{}
+                
+                    # Process each line of the certutil output
+                    foreach ($line in $CASecurity -split "`r`n") {
+                        if ($line -match "Allow\s+(.*?)\t(.*)") {
+                            $permTypes = $matches[1].Trim()
+                            $principal = $matches[2].Trim()
+                        
+                            # Skip default groups
+                            if ($defaultGroups -contains $principal) {
+                                continue
+                            }
+                        
+                            # Initialize principal if not already in hash
+                            if (-not $permissions.ContainsKey($principal)) {
+                                $permissions[$principal] = @{
+                                    "CA Administrator"    = $false
+                                    "Certificate Manager" = $false
+                                }
+                            }
+                        
+                            # Check for CA Administrator permission
+                            if ($permTypes -match "CA Administrator") {
+                                $permissions[$principal]["CA Administrator"] = $true
+                            }
+                        
+                            # Check for Certificate Manager permission
+                            if ($permTypes -match "Certificate Manager") {
+                                $permissions[$principal]["Certificate Manager"] = $true
+                            }
+                        }
+                    }
+                
+                    # Display results
+                    if ($permissions.Count -gt 0) {
+                        Write-Host " "
+                        Write-Host "[!] Non-default users with CA permissions:" -ForegroundColor Yellow
+                        foreach ($principal in $permissions.Keys) {
+                            $perms = @()
+                            if ($permissions[$principal]["CA Administrator"]) { $perms += "CA Administrator" }
+                            if ($permissions[$principal]["Certificate Manager"]) { $perms += "Certificate Manager" }
+                        
+                            Write-Host "  - $principal : $($perms -join ', ')" -ForegroundColor Red
+                        }
+                    }
+                    else {
+                        Write-Host "- No non-default users with CA permissions found." -ForegroundColor Green
+                    }
+                }
+                catch {
+                    Write-Host "- Error checking CA security permissions: $_" -ForegroundColor Red
+                }
+    
+                Write-Host " "
             }
         }
         else {
@@ -309,14 +444,51 @@ public class RpcDump
             [System.DirectoryServices.DirectoryEntry]$Connection,
             [string]$BaseDN
         )
-        $userSearch = [adsisearcher]"(&(objectCategory=person)(objectClass=user)(!(objectClass=computer))(!(objectClass=msDS-ManagedServiceAccount))(!(objectClass=msDS-GroupManagedServiceAccount)))"
-        $userSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
-        $userSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "userPrincipalName", "distinguishedName"))
-        $users = $userSearch.FindAll()
-
         Print-SectionHeader "All Domain Users"
-        foreach ($user in $users) {
-            Write-Host "Username: $($user.Properties['sAMAccountName'][0]), UPN: $($user.Properties['userPrincipalName'][0]), DN: $($user.Properties['distinguishedName'][0])"
+    
+        # Create a directory searcher with explicit property loading
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher($Connection)
+        $searcher.Filter = "(&(objectCategory=person)(objectClass=user))"
+        $searcher.PropertiesToLoad.AddRange(@("sAMAccountName", "userPrincipalName", "distinguishedName", "scriptPath"))
+        $searcher.PageSize = 1000
+    
+        $usersWithScripts = 0
+        $allUsers = 0
+
+        try {
+            $results = $searcher.FindAll()
+            foreach ($result in $results) {
+                $allUsers++
+                $username = $result.Properties['sAMAccountName'][0]
+                $upn = $result.Properties['userPrincipalName'][0]
+                $dn = $result.Properties['distinguishedName'][0]
+            
+                # Explicitly check for scriptPath in Properties collection
+                $scriptPath = $null
+                if ($result.Properties.Contains('scriptPath') -and $result.Properties['scriptPath'].Count -gt 0) {
+                    $scriptPath = $result.Properties['scriptPath'][0]
+                }
+
+                if (-not [string]::IsNullOrEmpty($scriptPath)) {
+                    $usersWithScripts++
+                    Write-Host "Username: $username, UPN: $upn, DN: $dn" 
+                    Write-Host "        |_[ScriptPath: $scriptPath]" -ForegroundColor Red
+                }
+                else {
+                    Write-Host "Username: $username, UPN: $upn, DN: $dn"
+                }
+            }
+        }
+        finally {
+            if ($results -ne $null) { $results.Dispose() }
+        }
+
+        Write-Host "`nProcessed $allUsers users total." -ForegroundColor Cyan
+        if ($usersWithScripts -eq 0) {
+            Write-Host "No users with scriptPath attribute found." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "Found $usersWithScripts users with scriptPath attribute." -ForegroundColor Cyan
         }
     }
 
