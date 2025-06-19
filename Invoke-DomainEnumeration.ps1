@@ -309,8 +309,9 @@ public class RpcDump
                 $caServer = $ca.Properties['dNSHostName'][0]
                 $caCN = $ca.Properties['cn'][0]
     
-                Write-Host "Enterprise CA: $caServer\$caName" -ForegroundColor Yellow
+                Write-Host "Enterprise CA: $caServer\$caName" -ForegroundColor Green
                 Write-Host "- CA Common Name: $caCN"
+                Write-Host " "
     
                 # Check if web enrollment is running
                 $webEnrollmentUrl = "http://$caServer/certsrv"
@@ -333,12 +334,12 @@ public class RpcDump
                         $response.Close()
             
                         if ($statusCode -eq 200 -or $statusCode -eq 401) {
-                            Write-Host "- [!] Web Enrollment: RUNNING (HTTP $statusCode)" -ForegroundColor Green
+                            Write-Host "- [!] Web Enrollment over HTTP: RUNNING (ESC8)" -ForegroundColor Yellow
                             Write-Host "- [!] Relay URL: $webEnrollmentUrl/certfnsh.asp" -ForegroundColor Red
                     
                             # Report NTLM auth status
                             if ($ntlmAuthEnabled) {
-                                Write-Host "- [!] NTLM Authentication: ENABLED (Vulnerable to Relay)" -ForegroundColor Red
+                                Write-Host "- [!] NTLM Authentication: ENABLED" -ForegroundColor Red
                             }
                             else {
                                 Write-Host "- [!] NTLM Authentication: DISABLED" -ForegroundColor Green
@@ -351,11 +352,11 @@ public class RpcDump
                         $ntlmAuthEnabled = $authHeaders -match "NTLM"
                 
                         if ($statusCode -eq 401) {
-                            Write-Host "- [!] Web Enrollment: RUNNING (HTTP $statusCode)" -ForegroundColor Green
+                            Write-Host "- [!] Web Enrollment over HTTP: RUNNING (ESC8)" -ForegroundColor Yellow
                             Write-Host "- [!] Relay URL: $webEnrollmentUrl/certfnsh.asp" -ForegroundColor Red
                     
                             if ($ntlmAuthEnabled) {
-                                Write-Host "- [!] NTLM Authentication: ENABLED (Vulnerable to Relay)" -ForegroundColor Red
+                                Write-Host "- [!] NTLM Authentication: ENABLED" -ForegroundColor Red
                             }
                             else {
                                 Write-Host "- [!] NTLM Authentication: DISABLED" -ForegroundColor Green
@@ -367,7 +368,6 @@ public class RpcDump
                     # Silently handle other errors (e.g., inaccessible servers)
                 }
 
-                # New: Check CA Security permissions
                 try {
                     $CASecurity = certutil.exe -config "$caServer\$caName" -getreg "CA\Security" 2>&1 | Out-String
                 
@@ -414,23 +414,39 @@ public class RpcDump
                     # Display results
                     if ($permissions.Count -gt 0) {
                         Write-Host " "
-                        Write-Host "[!] Non-default users with CA permissions:" -ForegroundColor Yellow
+                        Write-Host "- [!] Non-default users with CA permissions (ESC7):" -ForegroundColor Yellow
                         foreach ($principal in $permissions.Keys) {
                             $perms = @()
                             if ($permissions[$principal]["CA Administrator"]) { $perms += "CA Administrator" }
                             if ($permissions[$principal]["Certificate Manager"]) { $perms += "Certificate Manager" }
                         
-                            Write-Host "  - $principal : $($perms -join ', ')" -ForegroundColor Red
+                            Write-Host "   - $principal : $($perms -join ', ')" -ForegroundColor Red
                         }
+                        Write-Host " "
                     }
                     else {
-                        Write-Host "- No non-default users with CA permissions found." -ForegroundColor Green
+                        #Write-Host "- No non-default users with CA permissions found." -ForegroundColor Green
                     }
                 }
                 catch {
                     Write-Host "- Error checking CA security permissions: $_" -ForegroundColor Red
                 }
-    
+
+                try {
+                    $CASecurity2 = certutil.exe -config "$caServer\$caName" -getreg "policy\EditFlags" 2>&1 | Out-String
+                    if ($CASecurity2 -like "*EDITF_ATTRIBUTESUBJECTALTNAME2*") {
+                        Write-Host "- [!] Vulnerable flag found: EDITF_ATTRIBUTESUBJECTALTNAME2 (Potential ESC6)" -ForegroundColor Yellow
+                        Write-Host " "
+                    }
+                    $CASecurity3 = certutil.exe -config "$caServer\$caName" -getreg "CA\InterfaceFlags" 2>&1 | Out-String
+                    if ($CASecurity3 -like "*InterfaceFlags*REG_DWORD*10*") {
+                        Write-Host "- [!] Vulnerable flag found: Encryption is not enforced for RPC requests (ESC11)" -ForegroundColor Yellow
+                        Write-Host " "
+                    }
+                }
+                catch {
+                    Write-Host "- Error checking CA flags: $_" -ForegroundColor Red
+                }
                 Write-Host " "
             }
         }
@@ -471,23 +487,25 @@ public class RpcDump
 
                 if (-not [string]::IsNullOrEmpty($scriptPath)) {
                     $usersWithScripts++
-                    Write-Host "Username: $username, UPN: $upn, DN: $dn" 
-                    Write-Host "        |_[ScriptPath: $scriptPath]" -ForegroundColor Red
+                    Write-Host "samAccountName: $username"
+                    Write-Host "UPN: $upn"
+                    Write-Host "DN: $dn"
+                    Write-Host "scriptPath: $scriptPath" -ForegroundColor Red
+                    Write-Host " "
                 }
                 else {
-                    Write-Host "Username: $username, UPN: $upn, DN: $dn"
+                    Write-Host "samAccountName: $username"
+                    Write-Host "UPN: $upn"
+                    Write-Host "DN: $dn"
+                    Write-Host " "
                 }
             }
         }
         finally {
             if ($results -ne $null) { $results.Dispose() }
         }
-
         Write-Host "`nProcessed $allUsers users total." -ForegroundColor Cyan
-        if ($usersWithScripts -eq 0) {
-            Write-Host "No users with scriptPath attribute found." -ForegroundColor Yellow
-        }
-        else {
+        if ($usersWithScripts -gt 0) {
             Write-Host "Found $usersWithScripts users with scriptPath attribute." -ForegroundColor Cyan
         }
     }
@@ -499,12 +517,15 @@ public class RpcDump
         )
         $computerSearch = [adsisearcher]"(&(objectClass=computer)(!(objectClass=msDS-ManagedServiceAccount))(!(objectClass=msDS-GroupManagedServiceAccount)))"
         $computerSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
-        $computerSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "distinguishedName"))
+        $computerSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "distinguishedName", "operatingSystem"))
         $computers = $computerSearch.FindAll()
 
         Print-SectionHeader "All Domain Computers"
         foreach ($computer in $computers) {
-            Write-Host "Computer: $($computer.Properties['sAMAccountName'][0]), DN: $($computer.Properties['distinguishedName'][0])"
+            Write-Host "Computer: $($computer.Properties['sAMAccountName'][0])"
+            Write-Host "DN: $($computer.Properties['distinguishedName'][0])"
+            Write-Host "Platform: $($computer.Properties['operatingSystem'][0])"
+            Write-Host " "
         }
     }
 
