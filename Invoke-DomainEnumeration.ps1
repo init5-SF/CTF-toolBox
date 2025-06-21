@@ -370,24 +370,31 @@ public class RpcDump
 
                 try {
                     $CASecurity = certutil.exe -config "$caServer\$caName" -getreg "CA\Security" 2>&1 | Out-String
-                
+            
                     $defaultGroups = @(
                         "NT AUTHORITY\Authenticated Users",
                         "BUILTIN\Administrators",
-                        "$($domainName.Split('.')[0])\Domain Admins",
-                        "$($domainName.Split('.')[0])\Enterprise Admins"
+                        "Domain Admins",
+                        "Enterprise Admins"
                     )
-                
+            
                     $permissions = @{}
-                
+            
                     # Process each line of the certutil output
                     foreach ($line in $CASecurity -split "`r`n") {
                         if ($line -match "Allow\s+(.*?)\t(.*)") {
                             $permTypes = $matches[1].Trim()
                             $principal = $matches[2].Trim()
                         
-                            # Skip default groups
-                            if ($defaultGroups -contains $principal) {
+                            # Skip default groups - check if principal ends with any default group name
+                            $isDefault = $false
+                            foreach ($group in $defaultGroups) {
+                                if ($principal -like "*\$group" -or $principal -eq $group) {
+                                    $isDefault = $true
+                                    break
+                                }
+                            }
+                            if ($isDefault) {
                                 continue
                             }
                         
@@ -423,9 +430,6 @@ public class RpcDump
                             Write-Host "   - $principal : $($perms -join ', ')" -ForegroundColor Red
                         }
                         Write-Host " "
-                    }
-                    else {
-                        #Write-Host "- No non-default users with CA permissions found." -ForegroundColor Green
                     }
                 }
                 catch {
