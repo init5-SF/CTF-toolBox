@@ -560,7 +560,7 @@ public class RpcDump
 
         try {
             # Get current domain name (for SourceName)
-            $currentDomain = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name
+            $currentDomain = ($BaseDN -replace 'DC=','' -replace ',','.')
 
             # Search for all trust objects in the System container
             $trustSearch = [adsisearcher]"(&(objectClass=trustedDomain))"
