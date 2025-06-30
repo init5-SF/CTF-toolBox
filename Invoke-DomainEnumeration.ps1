@@ -6,6 +6,9 @@ function Invoke-DomainEnumeration {
         [string]$DC,
 
         [Parameter(Mandatory = $false)]
+        [string]$Domain,
+
+        [Parameter(Mandatory = $false)]
         [string]$Username,
 
         [Parameter(Mandatory = $false)]
@@ -308,35 +311,35 @@ public class RpcDump
                 $caName = $ca.Properties['name'][0]
                 $caServer = $ca.Properties['dNSHostName'][0]
                 $caCN = $ca.Properties['cn'][0]
-    
+
                 Write-Host "Enterprise CA: $caServer\$caName" -ForegroundColor Green
                 Write-Host "- CA Common Name: $caCN"
                 Write-Host " "
-    
+
                 # Check if web enrollment is running
                 $webEnrollmentUrl = "http://$caServer/certsrv"
                 try {
                     $request = [System.Net.WebRequest]::Create($webEnrollmentUrl)
                     $request.Method = "HEAD"  # Use HEAD to only fetch headers
                     $request.Timeout = 5000  # 5 second timeout
-        
+    
                     try {
                         $response = $request.GetResponse()
                         $statusCode = [int]$response.StatusCode
-                
+            
                         # Check for NTLM authentication header
                         $ntlmAuthEnabled = $false
                         $authHeaders = $response.Headers["WWW-Authenticate"]
                         if ($authHeaders -match "NTLM") {
                             $ntlmAuthEnabled = $true
                         }
-                
-                        $response.Close()
             
+                        $response.Close()
+        
                         if ($statusCode -eq 200 -or $statusCode -eq 401) {
                             Write-Host "- [!] Web Enrollment over HTTP: RUNNING (ESC8)" -ForegroundColor Yellow
                             Write-Host "- [!] Relay URL: $webEnrollmentUrl/certfnsh.asp" -ForegroundColor Red
-                    
+                
                             # Report NTLM auth status
                             if ($ntlmAuthEnabled) {
                                 Write-Host "- [!] NTLM Authentication: ENABLED" -ForegroundColor Red
@@ -350,11 +353,11 @@ public class RpcDump
                         $statusCode = [int]$_.Exception.Response.StatusCode
                         $authHeaders = $_.Exception.Response.Headers["WWW-Authenticate"]
                         $ntlmAuthEnabled = $authHeaders -match "NTLM"
-                
+            
                         if ($statusCode -eq 401) {
                             Write-Host "- [!] Web Enrollment over HTTP: RUNNING (ESC8)" -ForegroundColor Yellow
                             Write-Host "- [!] Relay URL: $webEnrollmentUrl/certfnsh.asp" -ForegroundColor Red
-                    
+                
                             if ($ntlmAuthEnabled) {
                                 Write-Host "- [!] NTLM Authentication: ENABLED" -ForegroundColor Red
                             }
@@ -370,22 +373,22 @@ public class RpcDump
 
                 try {
                     $CASecurity = certutil.exe -config "$caServer\$caName" -getreg "CA\Security" 2>&1 | Out-String
-            
+        
                     $defaultGroups = @(
                         "NT AUTHORITY\Authenticated Users",
                         "BUILTIN\Administrators",
                         "Domain Admins",
                         "Enterprise Admins"
                     )
-            
+        
                     $permissions = @{}
-            
+        
                     # Process each line of the certutil output
                     foreach ($line in $CASecurity -split "`r`n") {
                         if ($line -match "Allow\s+(.*?)\t(.*)") {
                             $permTypes = $matches[1].Trim()
                             $principal = $matches[2].Trim()
-                        
+                    
                             # Skip default groups - check if principal ends with any default group name
                             $isDefault = $false
                             foreach ($group in $defaultGroups) {
@@ -397,7 +400,7 @@ public class RpcDump
                             if ($isDefault) {
                                 continue
                             }
-                        
+                    
                             # Initialize principal if not already in hash
                             if (-not $permissions.ContainsKey($principal)) {
                                 $permissions[$principal] = @{
@@ -405,19 +408,19 @@ public class RpcDump
                                     "Certificate Manager" = $false
                                 }
                             }
-                        
+                    
                             # Check for CA Administrator permission
                             if ($permTypes -match "CA Administrator") {
                                 $permissions[$principal]["CA Administrator"] = $true
                             }
-                        
+                    
                             # Check for Certificate Manager permission
                             if ($permTypes -match "Certificate Manager") {
                                 $permissions[$principal]["Certificate Manager"] = $true
                             }
                         }
                     }
-                
+            
                     # Display results
                     if ($permissions.Count -gt 0) {
                         Write-Host " "
@@ -426,7 +429,7 @@ public class RpcDump
                             $perms = @()
                             if ($permissions[$principal]["CA Administrator"]) { $perms += "CA Administrator" }
                             if ($permissions[$principal]["Certificate Manager"]) { $perms += "Certificate Manager" }
-                        
+                    
                             Write-Host "   - $principal : $($perms -join ', ')" -ForegroundColor Red
                         }
                         Write-Host " "
@@ -453,12 +456,196 @@ public class RpcDump
                 }
                 Write-Host " "
             }
+
+            # Enumerate Certificate Templates
+            $defaultTemplates = @(
+                "Administrator", "CA", "CAExchange", "CEPEncryption", "ClientAuth", 
+                "CodeSigning", "CrossCA", "CTLSigning", "DirectoryEmailReplication", 
+                "DomainController", "DomainControllerAuthentication", "EFS", 
+                "EFSRecovery", "EnrollmentAgent", "EnrollmentAgentOffline", 
+                "ExchangeUser", "ExchangeUserSignature", "IPSECIntermediateOffline", 
+                "IPSECIntermediateOnline", "KerberosAuthentication", "KeyRecoveryAgent", 
+                "Machine", "MachineEnrollmentAgent", "OCSPResponseSigning", 
+                "OfflineRouter", "RASAndIASServer", "SmartcardLogon", "SmartcardUser", 
+                "SubCA", "User", "UserSignature", "WebServer", "Workstation"
+            )
+
+            $templateSearchBase = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC"
+            $templateSearch = [adsisearcher]"(&(objectClass=pKICertificateTemplate))"
+            $templateSearch.SearchRoot = [adsi]"LDAP://$DC/$templateSearchBase"
+            $templateSearch.PropertiesToLoad.AddRange(@("name", "displayName", "msPKI-Certificate-Name-Flag", "msPKI-Enrollment-Flag", "msPKI-Private-Key-Flag"))
+            $templates = $templateSearch.FindAll()
+            $nonDefaultTemplates = @()
+            $vulnerableTemplates = @()
+
+            foreach ($template in $templates) {
+                $templateName = $template.Properties['name'][0]
+                $displayName = $template.Properties['displayName'][0]
+            
+                if ($defaultTemplates -notcontains $templateName) {
+                    $nonDefaultTemplates += $templateName
+                    Write-Host "- [!] Non-default template found: $templateName ($displayName)" -ForegroundColor Yellow
+                }
+
+                # Check for vulnerable settings (ESC1, ESC2, etc.)
+                $enrollmentFlags = $template.Properties['msPKI-Enrollment-Flag'][0]
+                $certNameFlags = $template.Properties['msPKI-Certificate-Name-Flag'][0]
+                $privateKeyFlags = $template.Properties['msPKI-Private-Key-Flag'][0]
+
+                # ESC1: ENROLLEE_SUPPLIES_SUBJECT + CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT
+                if (($enrollmentFlags -band 0x00040000) -and ($certNameFlags -band 0x00000001)) {
+                    $vulnerableTemplates += "$templateName (ESC1 - Enrollee Supplies Subject)"
+                }
+
+                # ESC2: Any Purpose or Certificate Request Agent
+                if (($enrollmentFlags -band 0x00080000) -or ($templateName -eq "EnrollmentAgent")) {
+                    $vulnerableTemplates += "$templateName (ESC2 - Any Purpose/Agent)"
+                }
+            }
+            if ($vulnerableTemplates.Count -gt 0) {
+                Write-Host "`n- [!] Found $($vulnerableTemplates.Count) potentially vulnerable templates:" -ForegroundColor Red
+                $vulnerableTemplates | ForEach-Object { Write-Host "   - $_" -ForegroundColor Red }
+            }
         }
         else {
             Write-Host "Enterprise CA not found."
         }
     }
 
+    function Get-TrustedDomainDCs {
+        param (
+            [string]$DomainName
+        )
+
+        try {
+            # Method 1: DNS Query (SRV records)
+            Write-Host "`nEnumerating DCs for domain: $DomainName" -ForegroundColor Cyan
+            $dnsQuery = Resolve-DnsName -Type SRV -Name "_ldap._tcp.dc._msdcs.$DomainName" -ErrorAction SilentlyContinue
+            $dcs = $dnsQuery | Where-Object { $_.Type -eq 'SRV' } | Select-Object NameTarget -Unique
+
+            if ($dcs) {
+                Write-Host "[+] Domain Controllers in '$DomainName':" -ForegroundColor Green
+                $dcs | ForEach-Object { Write-Host "  - $($_.NameTarget)" }
+                Write-Host " "
+            }
+            else {
+                # Method 2: Fallback to LDAP (if DNS fails)
+                Write-Host "[!] DNS query failed. Trying LDAP..." -ForegroundColor Yellow
+                $domainEntry = New-Object System.DirectoryServices.DirectoryEntry "LDAP://$DomainName"
+                $searcher = New-Object System.DirectoryServices.DirectorySearcher($domainEntry)
+                $searcher.Filter = "(&(objectClass=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))"  # 8192 = DC
+                $searcher.PropertiesToLoad.Add("name") | Out-Null
+                $dcResults = $searcher.FindAll()
+
+                if ($dcResults.Count -gt 0) {
+                    Write-Host "[+] Domain Controllers in '$DomainName':" -ForegroundColor Green
+                    $dcResults | ForEach-Object { Write-Host "  - $($_.Properties['name'][0])" }
+                }
+                else {
+                    Write-Host "[-] No DCs found for '$DomainName'." -ForegroundColor Red
+                }
+            }
+        }
+        catch {
+            Write-Host "[!] Error fetching DCs for '$DomainName': $_" -ForegroundColor Red
+        }
+    }
+    function List-Trusts {
+        param (
+            [System.DirectoryServices.DirectoryEntry]$Connection,
+            [string]$BaseDN
+        )
+
+        Print-SectionHeader "Active Directory Trusts"
+
+        try {
+            # Get current domain name (for SourceName)
+            $currentDomain = ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name
+
+            # Search for all trust objects in the System container
+            $trustSearch = [adsisearcher]"(&(objectClass=trustedDomain))"
+            $trustSearch.SearchRoot = [adsi]"LDAP://$DC/CN=System,$BaseDN"
+            $trustSearch.PropertiesToLoad.AddRange(@(
+                    "name", # Target domain name (e.g., "logistics.ad")
+                    "trustDirection", # 1=Inbound, 2=Outbound, 3=Bidirectional
+                    "trustType", # 1=Downlevel (NT), 2=Uplevel (AD), etc.
+                    "trustAttributes", # Flags (e.g., FOREST_TRANSITIVE, WITHIN_FOREST)
+                    "securityIdentifier", # SID of the trusted domain
+                    "flatName"            # NetBIOS name (e.g., "LOGISTICS")
+                ))
+            $trusts = $trustSearch.FindAll()
+
+            if ($trusts.Count -eq 0) {
+                Write-Host "No domain trusts found." -ForegroundColor Yellow
+                return
+            }
+
+            foreach ($trust in $trusts) {
+                $targetName = $trust.Properties['name'][0]
+                $netBiosName = if ($trust.Properties['flatName']) { $trust.Properties['flatName'][0] } else { "N/A" }
+                $trustDirection = $trust.Properties['trustDirection'][0]
+                $trustType = $trust.Properties['trustType'][0]
+                $trustAttributes = $trust.Properties['trustAttributes'][0]
+                $trustSid = if ($trust.Properties['securityIdentifier']) { 
+                (New-Object System.Security.Principal.SecurityIdentifier($trust.Properties['securityIdentifier'][0], 0)).Value 
+                }
+                else { "N/A" }
+
+                $directionMap = @{
+                    0 = "Disabled"
+                    1 = "Inbound"
+                    2 = "Outbound"
+                    3 = "Bidirectional"
+                }
+                $directionText = $directionMap[$trustDirection]
+
+                $typeMap = @{
+                    1 = "DOWNLEVEL"  # NT domain
+                    2 = "WINDOWS_ACTIVE_DIRECTORY"
+                    3 = "MIT"
+                    4 = "DCE"
+                }
+                $typeText = $typeMap[$trustType]
+
+                # Decode trustAttributes (like PowerView)
+                $attributeFlags = @()
+                if ($trustAttributes -band 0x1) { $attributeFlags += "NON_TRANSITIVE" }
+                if ($trustAttributes -band 0x2) { $attributeFlags += "UPLEVEL_ONLY" }
+                if ($trustAttributes -band 0x4) { $attributeFlags += "QUARANTINED_DOMAIN" }
+                if ($trustAttributes -band 0x8) { $attributeFlags += "FOREST_TRANSITIVE (Forest-wide Authentication)" }
+                if ($trustAttributes -band 0x10) { $attributeFlags += "CROSS_ORGANIZATION (Selective Authentication)" }
+                if ($trustAttributes -band 0x20) { $attributeFlags += "WITHIN_FOREST" }
+                if ($trustAttributes -band 0x40) { $attributeFlags += "TREAT_AS_EXTERNAL" }
+                if ($trustAttributes -band 0x80) { $attributeFlags += "USES_RC4_ENCRYPTION" }
+                if ($trustAttributes -band 0x200) { $attributeFlags += "CROSS_ORGANIZATION_NO_TGT_DELEGATION" }
+                if ($trustAttributes -band 0x800) { $attributeFlags += "CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION" }
+                $attributesText = if ($attributeFlags.Count -gt 0) { $attributeFlags -join "," } else { "None" }
+
+                # Highlight high-risk trusts (external, bidirectional, RC4)
+                $highlightColor = if (
+                ($trustDirection -eq 3) -or # Bidirectional
+                ($trustAttributes -band 0x40) -or # External
+                ($trustAttributes -band 0x80)        # RC4
+                ) { "Red" } else { "Green" }
+
+                # Display trust details (PowerView-style)
+                Write-Host "SourceName      : $currentDomain" -ForegroundColor Green
+                Write-Host "TargetName      : $targetName ($netBiosName)" -ForegroundColor Green
+                Write-Host "TrustType       : $typeText"
+                Write-Host "TrustAttributes : $attributesText" -ForegroundColor $highlightColor
+                Write-Host "TrustDirection  : $directionText"
+                Write-Host "TrustSID        : $trustSid"
+                Write-Host " "
+            
+                if ($trustDirection -eq 1 -or $trustDirection -eq 3) {
+                    Get-TrustedDomainDCs -DomainName $targetName
+                }
+            }
+        }
+        catch {
+            Write-Host "Error enumerating trusts: $_" -ForegroundColor Red
+        }
+    }
     function List-Users {
         param (
             [System.DirectoryServices.DirectoryEntry]$Connection,
@@ -540,17 +727,42 @@ public class RpcDump
         )
         $managedSearch = [adsisearcher]"(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-ManagedServiceAccount))"
         $managedSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
-        $managedSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "userPrincipalName", "distinguishedName", "description", "objectClass"))
+        $managedSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "userPrincipalName", "distinguishedName", "description", "objectClass", "msDS-GroupMSAMembership", "objectSid"))
         $managedAccounts = $managedSearch.FindAll()
 
         Print-SectionHeader "Service Accounts"
         foreach ($account in $managedAccounts) {
             $samAccountName = $account.Properties['sAMAccountName'][0]
-            $description = $account.Properties['description'][0]
+            $description = if ($account.Properties['description']) { $account.Properties['description'][0] } else { $null }
             $objectClass = $account.Properties['objectClass']
-
+            $objectSid = if ($account.Properties['objectSid']) { 
+            (New-Object System.Security.Principal.SecurityIdentifier($account.Properties['objectSid'][0], 0)).Value 
+            }
+            else { $null }
             if ($objectClass -contains "msDS-GroupManagedServiceAccount") {
                 $accountType = "Group Managed Service Account (gMSA)"
+            
+                # Get principals that can retrieve the gMSA password
+                $allowedPrincipals = @()
+                if ($account.Properties['msDS-GroupMSAMembership']) {
+                    $sdBytes = $account.Properties['msDS-GroupMSAMembership'][0]
+                    try {
+                        # Create a security descriptor from the byte array
+                        $sd = New-Object System.DirectoryServices.ActiveDirectorySecurity
+                        $sd.SetSecurityDescriptorBinaryForm($sdBytes)
+                    
+                        # Get all access rules
+                        foreach ($rule in $sd.GetAccessRules($true, $true, [System.Security.Principal.NTAccount])) {
+                            if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) {
+                                $identity = $rule.IdentityReference.Value
+                                $allowedPrincipals += $identity
+                            }
+                        }
+                    }
+                    catch {
+                        Write-Host "  - [Error] Could not parse security descriptor: $_" -ForegroundColor Red
+                    }
+                }
             }
             elseif ($objectClass -contains "msDS-ManagedServiceAccount") {
                 $accountType = "Managed Service Account (MSA)"
@@ -561,7 +773,19 @@ public class RpcDump
 
             Write-Host "SAM Account Name: $samAccountName"
             Write-Host "Account Type: $accountType"
-            Write-Host "Description: $description"
+            if ($objectSid) {
+                Write-Host "Object SID: $objectSid"
+            }
+            if ($description) {
+                Write-Host "Description: $description" -ForegroundColor Yellow
+            }
+        
+            if ($allowedPrincipals.Count -gt 0) {
+                Write-Host "Password Retrieval Allowed For:" -ForegroundColor Red
+                foreach ($principal in $allowedPrincipals) {
+                    Write-Host "  - $principal" -ForegroundColor Red
+                }
+            }
             Write-Host " "
         }
     }
@@ -573,12 +797,17 @@ public class RpcDump
         )
         $dcSearch = [adsisearcher]"(&(userAccountControl:1.2.840.113556.1.4.803:=8192))"
         $dcSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
-        $dcSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "distinguishedName"))
+        $dcSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "distinguishedName", "serverReferenceBL"))
         $dcs = $dcSearch.FindAll()
 
         Print-SectionHeader "Domain Controllers"
         foreach ($dc in $dcs) {
             Write-Host "Domain Controller: $($dc.Properties['sAMAccountName'][0]), DN: $($dc.Properties['distinguishedName'][0])"
+            $site = $($dc.Properties['serverReferenceBL'][0])
+            if ($site -match 'CN=([^,]+),CN=Sites') {
+                $adsite = $matches[1]
+                Write-Host "AD Site: $adsite "
+            }
         }
     }
 
@@ -1052,17 +1281,27 @@ public class RpcDump
             }
         }
     }
-
     # Main script execution
     try {
         # Extract domain name from the provided username
-        if ($Username -and ($Username -match "^[^@]+@[^@]+\.[^@]+$")) {
+        
+        if ($Domain) {
+            if ($Domain -notmatch "\.") {
+                $Domain = Write-Host "[X] Invalid domain name format." -ForegroundColor Yellow
+                break
+            }
+            else {
+                $domainName = $Domain
+            }
+        }
+        elseif ($Username -and ($Username -match "^[^@]+@[^@]+\.[^@]+$")) {
             $domainName = $Username.Split('@')[-1]
         }
         else {
             $domainName = (Get-WmiObject Win32_ComputerSystem).Domain
             if ($domainName -notmatch "\.") {
-                $domainName = Read-Host "This machine is not domain-joined. Enter domain name (e.g., company.local)"
+                $domainName = Write-Host "[X] This machine is not domain-joined. Enter domain name (e.g., company.local)" -ForegroundColor Yellow
+                break
             }
         }
         $baseDN = ($domainName.Split('.') | ForEach-Object { "DC=$_" }) -join ','
@@ -1085,6 +1324,7 @@ public class RpcDump
 
         # Display domain and CA information
         Get-DomainInfo -Connection $connection -BaseDN $baseDN
+        List-Trusts -Connection $connection -BaseDN $baseDN
         Get-EnterpriseCA -Connection $connection -ConfigNC $configNC
         List-SCCMInstances -Connection $connection -BaseDN $baseDN
         Get-WSUSConfiguration
