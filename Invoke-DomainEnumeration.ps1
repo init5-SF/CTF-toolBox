@@ -1,4 +1,4 @@
-# Usage: Invoke-DomainEnumeration -DC 10.10.10.10 -Username user1@domain.com -Password s3cr3tPass
+# Usage: Invoke-DomainEnumeration -DC 10.10.10.10 -Domain domain.com -Username user1@domain.com -Password s3cr3tPass
 
 function Invoke-DomainEnumeration {
     param (
