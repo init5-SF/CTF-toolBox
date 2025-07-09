@@ -560,7 +560,7 @@ public class RpcDump
 
         try {
             # Get current domain name (for SourceName)
-            $currentDomain = ($BaseDN -replace 'DC=','' -replace ',','.')
+            $currentDomain = ($BaseDN -replace 'DC=', '' -replace ',', '.')
 
             # Search for all trust objects in the System container
             $trustSearch = [adsisearcher]"(&(objectClass=trustedDomain))"
@@ -587,7 +587,7 @@ public class RpcDump
                 $trustType = $trust.Properties['trustType'][0]
                 $trustAttributes = $trust.Properties['trustAttributes'][0]
                 $trustSid = if ($trust.Properties['securityIdentifier']) { 
-                (New-Object System.Security.Principal.SecurityIdentifier($trust.Properties['securityIdentifier'][0], 0)).Value 
+                    (New-Object System.Security.Principal.SecurityIdentifier($trust.Properties['securityIdentifier'][0], 0)).Value 
                 }
                 else { "N/A" }
 
@@ -617,15 +617,18 @@ public class RpcDump
                 if ($trustAttributes -band 0x20) { $attributeFlags += "WITHIN_FOREST" }
                 if ($trustAttributes -band 0x40) { $attributeFlags += "TREAT_AS_EXTERNAL" }
                 if ($trustAttributes -band 0x80) { $attributeFlags += "USES_RC4_ENCRYPTION" }
+                if ($trustAttributes -band 0x100) { $attributeFlags += "USES_AES_KEYS" }
                 if ($trustAttributes -band 0x200) { $attributeFlags += "CROSS_ORGANIZATION_NO_TGT_DELEGATION" }
+                if ($trustAttributes -band 0x400) { $attributeFlags += "PIM_TRUST" }
                 if ($trustAttributes -band 0x800) { $attributeFlags += "CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION" }
                 $attributesText = if ($attributeFlags.Count -gt 0) { $attributeFlags -join "," } else { "None" }
 
-                # Highlight high-risk trusts (external, bidirectional, RC4)
                 $highlightColor = if (
-                ($trustDirection -eq 3) -or # Bidirectional
-                ($trustAttributes -band 0x40) -or # External
-                ($trustAttributes -band 0x80)        # RC4
+                    ($trustDirection -eq 3) -or
+                    ($trustAttributes -band 0x40) -or
+                    ($trustAttributes -band 0x8) -or
+                    ($trustAttributes -band 0x800) -or
+                    ($trustAttributes -band 0x80)
                 ) { "Red" } else { "Green" }
 
                 # Display trust details (PowerView-style)
@@ -652,15 +655,35 @@ public class RpcDump
             [string]$BaseDN
         )
         Print-SectionHeader "All Domain Users"
-    
+
+        # Get current domain trusts first (for SID History matching)
+        $trusts = @{}
+        try {
+            $trustSearch = [adsisearcher]"(&(objectClass=trustedDomain))"
+            $trustSearch.SearchRoot = [adsi]"LDAP://$DC/CN=System,$BaseDN"
+            $trustSearch.PropertiesToLoad.AddRange(@("name", "securityIdentifier"))
+            $trustResults = $trustSearch.FindAll()
+        
+            foreach ($trust in $trustResults) {
+                if ($trust.Properties['securityIdentifier']) {
+                    $trustSid = (New-Object System.Security.Principal.SecurityIdentifier($trust.Properties['securityIdentifier'][0], 0)).Value
+                    $trusts[$trustSid] = $trust.Properties['name'][0]
+                }
+            }
+        }
+        catch {
+            Write-Host "Error enumerating trusts for SID History matching: $_" -ForegroundColor Yellow
+        }
+
         # Create a directory searcher with explicit property loading
         $searcher = New-Object System.DirectoryServices.DirectorySearcher($Connection)
         $searcher.Filter = "(&(objectCategory=person)(objectClass=user))"
-        $searcher.PropertiesToLoad.AddRange(@("sAMAccountName", "userPrincipalName", "distinguishedName", "scriptPath"))
+        $searcher.PropertiesToLoad.AddRange(@("sAMAccountName", "userPrincipalName", "distinguishedName", "sIDHistory", "scriptPath"))
         $searcher.PageSize = 1000
-    
+
         $usersWithScripts = 0
         $allUsers = 0
+        $usersWithSidHistory = 0
 
         try {
             $results = $searcher.FindAll()
@@ -678,26 +701,65 @@ public class RpcDump
 
                 if (-not [string]::IsNullOrEmpty($scriptPath)) {
                     $usersWithScripts++
-                    Write-Host "samAccountName: $username"
-                    Write-Host "UPN: $upn"
-                    Write-Host "DN: $dn"
+                }
+
+                # Always write these common properties
+                Write-Host "samAccountName: $username"
+                Write-Host "UPN: $upn"
+                Write-Host "DN: $dn"
+            
+                if (-not [string]::IsNullOrEmpty($scriptPath)) {
                     Write-Host "scriptPath: $scriptPath" -ForegroundColor Red
-                    Write-Host " "
                 }
-                else {
-                    Write-Host "samAccountName: $username"
-                    Write-Host "UPN: $upn"
-                    Write-Host "DN: $dn"
-                    Write-Host " "
+            
+                # Handle SID History
+                if ($result.Properties['sIDHistory'] -and $result.Properties['sIDHistory'].Count -gt 0) {
+                    $usersWithSidHistory++
+                    foreach ($sidBytes in $result.Properties['sIDHistory']) {
+                        try {
+                            $sid = New-Object System.Security.Principal.SecurityIdentifier($sidBytes, 0)
+                            $sidString = $sid.Value
+                            Write-Host "SID History: $sidString" -ForegroundColor Yellow
+            
+                            # Split the SID into parts
+                            $sidParts = $sidString -split '-'
+            
+                            # Only proceed if we have a valid SID format
+                            if ($sidParts.Count -ge 4) {
+                                # Get the domain portion (remove the last RID component)
+                                $domainSid = $sidParts[0..($sidParts.Count - 2)] -join '-'
+                
+                                # Check against all trusted domains
+                                foreach ($trust in $trusts.GetEnumerator()) {
+                                    $trustSid = $trust.Key
+                                    $trustName = $trust.Value
+                    
+                                    # Compare the domain portions
+                                    if ($domainSid -eq $trustSid) {
+                                        Write-Host "  [!] SID History allows access to: $trustName" -ForegroundColor Red
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                        catch {
+                            
+                        }
+                    }
                 }
+                Write-Host " "
             }
         }
         finally {
             if ($results -ne $null) { $results.Dispose() }
         }
+    
         Write-Host "`nProcessed $allUsers users total." -ForegroundColor Cyan
         if ($usersWithScripts -gt 0) {
             Write-Host "Found $usersWithScripts users with scriptPath attribute." -ForegroundColor Cyan
+        }
+        if ($usersWithSidHistory -gt 0) {
+            Write-Host "Found $usersWithSidHistory users with SID History." -ForegroundColor Cyan
         }
     }
 
@@ -719,6 +781,177 @@ public class RpcDump
             Write-Host " "
         }
     }
+    function List-ShadowPrincipals {
+        param (
+            [System.DirectoryServices.DirectoryEntry]$Connection,
+            [string]$ConfigNC
+        )
+    
+        Print-SectionHeader "Shadow Principals"
+    
+        try {
+            $shadowPrincipalBase = "CN=Shadow Principal Configuration,CN=Services,$ConfigNC"
+            $shadowPrincipalSearch = [adsisearcher]"(&(objectClass=msDS-ShadowPrincipal))"
+            $shadowPrincipalSearch.SearchRoot = [adsi]"LDAP://$DC/$shadowPrincipalBase"
+            $shadowPrincipalSearch.PropertiesToLoad.AddRange(@("name", "member", "msDS-ShadowPrincipalSid"))
+            $shadowPrincipals = $shadowPrincipalSearch.FindAll()
+
+            if ($shadowPrincipals.Count -eq 0) {
+                Write-Host "No Shadow Principals found." -ForegroundColor Yellow
+                return
+            }
+
+            # Get all domain trusts for SID mapping
+            $trusts = @{}
+            $trustSearch = [adsisearcher]"(&(objectClass=trustedDomain))"
+            $trustSearch.SearchRoot = [adsi]"LDAP://$DC/CN=System,$($connection.distinguishedName)"
+            $trustSearch.PropertiesToLoad.AddRange(@("name", "securityIdentifier", "flatName"))
+            $trustResults = $trustSearch.FindAll()
+        
+            foreach ($trust in $trustResults) {
+                if ($trust.Properties['securityIdentifier']) {
+                    $trustSid = (New-Object System.Security.Principal.SecurityIdentifier($trust.Properties['securityIdentifier'][0], 0)).Value
+                    $trusts[$trustSid] = @{
+                        "Domain"  = $trust.Properties['name'][0]
+                        "NetBIOS" = if ($trust.Properties['flatName']) { $trust.Properties['flatName'][0] } else { $null }
+                    }
+                }
+            }
+
+            foreach ($principal in $shadowPrincipals) {
+                $name = $principal.Properties['name'][0]
+                $members = $principal.Properties['member']
+                $shadowSid = if ($principal.Properties['msDS-ShadowPrincipalSid']) { 
+                    $sidBytes = $principal.Properties['msDS-ShadowPrincipalSid'][0]
+                    $sid = New-Object System.Security.Principal.SecurityIdentifier($sidBytes, 0)
+                    $sid.Value
+                }
+                else { $null }
+
+                # Only show if there are members
+                if ($members -and $members.Count -gt 0) {
+                    Write-Host "Shadow Principal: $name" -ForegroundColor Yellow
+                
+                    if ($shadowSid) {
+                        # First try to resolve locally
+                        $resolvedName = $null
+                        $sourceDomain = $null
+                        $objectType = $null
+                    
+                        try {
+                            $ntAccount = $sid.Translate([System.Security.Principal.NTAccount])
+                            $resolvedName = $ntAccount.Value
+                        
+                            # Determine object type
+                            try {
+                                $obj = [adsi]("LDAP://<SID=$shadowSid>")
+                                if ($obj.Properties['objectClass'] -contains 'group') {
+                                    $objectType = "Group"
+                                }
+                                elseif ($obj.Properties['objectClass'] -contains 'user') {
+                                    $objectType = "User"
+                                }
+                                else {
+                                    $objectType = "Unknown"
+                                }
+                            }
+                            catch {
+                                $objectType = "Unknown"
+                            }
+                        
+                            Write-Host "Shadow SID: $shadowSid ($resolvedName - $objectType)" -ForegroundColor Cyan
+                        }
+                        catch {
+                            # If local translation fails, try to identify the source domain
+                            $sidParts = $shadowSid -split '-'
+                            if ($sidParts.Count -ge 3) {
+                                $domainSid = $sidParts[0..($sidParts.Count - 2)] -join '-'
+                            
+                                # Check if this is from a known trusted domain
+                                $trustMatch = $trusts.GetEnumerator() | Where-Object { $_.Key -eq $domainSid } | Select-Object -First 1
+                            
+                                if ($trustMatch) {
+                                    $sourceDomain = $trustMatch.Value.Domain
+                                    $netbiosName = $trustMatch.Value.NetBIOS
+                                
+                                    # Try to resolve the SID in the foreign domain
+                                    $foreignObject = $null
+                                    try {
+                                        # Create a connection to the foreign domain
+                                        $foreignDN = ($sourceDomain.Split('.') | ForEach-Object { "DC=$_" }) -join ','
+                                        $foreignLDAP = "LDAP://$DC/$foreignDN"
+                                    
+                                        if ($Username -and $Password) {
+                                            $foreignConn = New-Object System.DirectoryServices.DirectoryEntry($foreignLDAP, $Username, $Password)
+                                        }
+                                        else {
+                                            $foreignConn = New-Object System.DirectoryServices.DirectoryEntry($foreignLDAP)
+                                        }
+                                    
+                                        if ($foreignConn.Path) {
+                                            # Try to find the object by SID
+                                            $searcher = New-Object System.DirectoryServices.DirectorySearcher($foreignConn)
+                                            $searcher.Filter = "(objectSid=$shadowSid)"
+                                            $searcher.PropertiesToLoad.AddRange(@("samAccountName", "objectClass", "distinguishedName"))
+                                            $result = $searcher.FindOne()
+                                        
+                                            if ($result) {
+                                                $samAccount = $result.Properties['samAccountName'][0]
+                                                $dn = $result.Properties['distinguishedName'][0]
+                                            
+                                                if ($result.Properties['objectClass'] -contains 'group') {
+                                                    $objectType = "Group"
+                                                    $resolvedName = "$netbiosName\$samAccount"
+                                                }
+                                                elseif ($result.Properties['objectClass'] -contains 'user') {
+                                                    $objectType = "User"
+                                                    $resolvedName = "$netbiosName\$samAccount"
+                                                }
+                                                else {
+                                                    $objectType = "Unknown"
+                                                    $resolvedName = "$netbiosName\$samAccount"
+                                                }
+                                            
+                                                Write-Host "Shadow SID: $shadowSid ($resolvedName - $objectType)" -ForegroundColor Red
+                                                Write-Host "  DN: $dn" -ForegroundColor DarkCyan
+                                            }
+                                            else {
+                                                Write-Host "Shadow SID: $shadowSid (From $sourceDomain but object not found)" -ForegroundColor Red
+                                            }
+                                        }
+                                        else {
+                                            Write-Host "Shadow SID: $shadowSid (From $sourceDomain but could not connect)" -ForegroundColor Red
+                                        }
+                                    }
+                                    catch {
+                                        Write-Host "Shadow SID: $shadowSid (From $sourceDomain but resolution failed: $($_.Exception.Message))" -ForegroundColor Yellow
+                                    }
+                                }
+                                else {
+                                    Write-Host "Shadow SID: $shadowSid (Unknown source - not from any trusted domain)" -ForegroundColor Red
+                                }
+                            }
+                            else {
+                                Write-Host "Shadow SID: $shadowSid (Invalid SID format)" -ForegroundColor Red
+                            }
+                        }
+                    }
+                    else {
+                        Write-Host "Shadow SID: [Not set]" -ForegroundColor Yellow
+                    }
+
+                    Write-Host "Members:"
+                    foreach ($member in $members) {
+                        Write-Host "  - $member" -ForegroundColor Green
+                    }
+                    Write-Host " "
+                }
+            }
+        }
+        catch {
+            Write-Host "Error enumerating Shadow Principals: $_" -ForegroundColor Red
+        }
+    }
 
     function List-ManagedServiceAccounts {
         param (
@@ -736,7 +969,7 @@ public class RpcDump
             $description = if ($account.Properties['description']) { $account.Properties['description'][0] } else { $null }
             $objectClass = $account.Properties['objectClass']
             $objectSid = if ($account.Properties['objectSid']) { 
-            (New-Object System.Security.Principal.SecurityIdentifier($account.Properties['objectSid'][0], 0)).Value 
+                (New-Object System.Security.Principal.SecurityIdentifier($account.Properties['objectSid'][0], 0)).Value 
             }
             else { $null }
             if ($objectClass -contains "msDS-GroupManagedServiceAccount") {
@@ -850,6 +1083,13 @@ public class RpcDump
             [System.DirectoryServices.DirectoryEntry]$Connection,
             [string]$BaseDN
         )
+    
+        # Define default admin accounts
+        $defaultAdminAccounts = @(
+            "Administrator",
+            "krbtgt"
+        )
+
         $adminCountSearch = [adsisearcher]"(&(objectClass=user)(adminCount=1))"
         $adminCountSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
         $adminCountSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "userPrincipalName", "distinguishedName"))
@@ -857,7 +1097,72 @@ public class RpcDump
 
         Print-SectionHeader "Users with adminCount=1"
         foreach ($user in $adminCountUsers) {
-            Write-Host "Username: $($user.Properties['sAMAccountName'][0]), UPN: $($user.Properties['userPrincipalName'][0]), DN: $($user.Properties['distinguishedName'][0])"
+            $username = $user.Properties['sAMAccountName'][0]
+            $upn = $user.Properties['userPrincipalName'][0]
+            $dn = $user.Properties['distinguishedName'][0]
+        
+            if ($defaultAdminAccounts -contains $username) {
+                Write-Host "Username: $username"
+                Write-Host "UPN: $upn"
+                Write-Host "DN: $dn"
+            }
+            else {
+                Write-Host "Username: $username" -ForegroundColor Yellow
+                Write-Host "UPN: $upn" -ForegroundColor Yellow
+                Write-Host "DN: $dn" -ForegroundColor Yellow
+            }
+            Write-Host " "
+        }
+    }
+
+    function List-AdminCountEquals1Groups {
+        param (
+            [System.DirectoryServices.DirectoryEntry]$Connection,
+            [string]$BaseDN
+        )
+    
+        # Define default admin groups
+        $defaultAdminGroups = @(
+            "Administrators",
+            "Print Operators",
+            "Backup Operators",
+            "Replicator",
+            "Enterprise Key Admins",
+            "Key Admins",
+            "Domain Controllers",
+            "Schema Admins",
+            "Enterprise Admins",
+            "Domain Admins",
+            "Server Operators",
+            "Account Operators",
+            "Read-only Domain Controllers"
+        )
+
+        $adminCountSearch = [adsisearcher]"(&(objectClass=group)(adminCount=1))"
+        $adminCountSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+        $adminCountSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "objectSid", "distinguishedName"))
+        $adminCountGroups = $adminCountSearch.FindAll()
+
+        Print-SectionHeader "Groups with adminCount=1"
+        foreach ($group in $adminCountGroups) {
+            $groupName = $group.Properties['sAMAccountName'][0]
+            $dn = $group.Properties['distinguishedName'][0]
+            $sid = if ($group.Properties['objectSid']) { 
+                (New-Object System.Security.Principal.SecurityIdentifier($group.Properties['objectSid'][0], 0)).Value 
+            }
+            else { "N/A" }
+        
+            if ($defaultAdminGroups -contains $groupName) {
+                Write-Host "Group name: $groupName"
+                Write-Host "SID: $sid"
+                Write-Host "DN: $dn"
+            }
+            else {
+                Write-Host "Group name: $groupName" -ForegroundColor Yellow
+                Write-Host "SID: $sid" -ForegroundColor Yellow
+                Write-Host "DN: $dn" -ForegroundColor Yellow
+            }
+            Write-Host " "
         }
     }
 
@@ -1322,13 +1627,12 @@ public class RpcDump
         $rootDSE = [adsi]"LDAP://$DC/RootDSE"
         $configNC = $rootDSE.configurationNamingContext
 
-        # Display domain and CA information
         Get-DomainInfo -Connection $connection -BaseDN $baseDN
         List-Trusts -Connection $connection -BaseDN $baseDN
+        List-ShadowPrincipals -Connection $connection -ConfigNC $configNC
         Get-EnterpriseCA -Connection $connection -ConfigNC $configNC
         List-SCCMInstances -Connection $connection -BaseDN $baseDN
         Get-WSUSConfiguration
-        # List other objects
         List-Users -Connection $connection -BaseDN $baseDN
         List-Computers -Connection $connection -BaseDN $baseDN
         Find-PossibleRBCD -Connection $connection -BaseDN $baseDN
@@ -1339,6 +1643,7 @@ public class RpcDump
         List-KerberoastableUsers -Connection $connection -BaseDN $baseDN
         List-ASREPRoastableUsers -Connection $connection -BaseDN $baseDN
         List-AdminCountEquals1Users -Connection $connection -BaseDN $baseDN
+        List-AdminCountEquals1Groups -Connection $connection -BaseDN $baseDN
         List-UsersWithWeakDescription -Connection $connection -BaseDN $baseDN
         List-DomainAdmins -Connection $connection -BaseDN $baseDN
         List-ConstrainedDelegationAccounts -Connection $connection -BaseDN $baseDN
