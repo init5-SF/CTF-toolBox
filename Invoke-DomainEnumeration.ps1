@@ -1,4 +1,4 @@
-# Usage: Invoke-DomainEnumeration -DC 10.10.10.10 -Domain domain.com -Username user1@domain.com -Password s3cr3tPass
+# Usage: Invoke-DomainEnumeration -DC dc01.domain.com -Domain domain.com (optional: -Username user1@domain.com -Password s3cr3tPass)
 
 function Invoke-DomainEnumeration {
     param (
@@ -1627,12 +1627,14 @@ public class RpcDump
         $rootDSE = [adsi]"LDAP://$DC/RootDSE"
         $configNC = $rootDSE.configurationNamingContext
 
+        # Display domain and CA information
         Get-DomainInfo -Connection $connection -BaseDN $baseDN
         List-Trusts -Connection $connection -BaseDN $baseDN
         List-ShadowPrincipals -Connection $connection -ConfigNC $configNC
         Get-EnterpriseCA -Connection $connection -ConfigNC $configNC
         List-SCCMInstances -Connection $connection -BaseDN $baseDN
         Get-WSUSConfiguration
+        # List other objects
         List-Users -Connection $connection -BaseDN $baseDN
         List-Computers -Connection $connection -BaseDN $baseDN
         Find-PossibleRBCD -Connection $connection -BaseDN $baseDN
