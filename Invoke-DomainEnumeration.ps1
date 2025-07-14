@@ -576,7 +576,7 @@ public class RpcDump
             $trusts = $trustSearch.FindAll()
 
             if ($trusts.Count -eq 0) {
-                Write-Host "No domain trusts found." -ForegroundColor Yellow
+                Write-Host "No domain trusts found."
                 return
             }
 
@@ -797,7 +797,7 @@ public class RpcDump
             $shadowPrincipals = $shadowPrincipalSearch.FindAll()
 
             if ($shadowPrincipals.Count -eq 0) {
-                Write-Host "No Shadow Principals found." -ForegroundColor Yellow
+                Write-Host "No Shadow Principals found."
                 return
             }
 
@@ -1207,6 +1207,7 @@ public class RpcDump
         )
         Print-SectionHeader "SCCM Info"
         try {
+            # Part 1: Find SCCM Management Points
             $sccmSearch = [adsisearcher]"(objectClass=mSSMSManagementPoint)"
             $sccmSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
             $sccmSearch.PropertiesToLoad.Add("dNSHostName") | Out-Null
@@ -1216,11 +1217,65 @@ public class RpcDump
                 foreach ($instance in $sccmInstances) {
                     $dnsHostName = $instance.Properties['dNSHostName'][0]
                     Write-Host "SCCM Management Point: $dnsHostName"
-                    Write-Host " "
                 }
             }
             else {
-                Write-Host "No SCCM instances found."
+                Write-Host "No SCCM management points found."
+            }
+
+            # Part 2: Find SCCM Site Code
+            $siteSearch = [adsisearcher]"(objectClass=mSSMSSite)"
+            $siteSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+            $siteSearch.PropertiesToLoad.Add("mSSMSSiteCode") | Out-Null
+            $siteResults = $siteSearch.FindAll()
+
+            if ($siteResults.Count -gt 0) {
+                foreach ($site in $siteResults) {
+                    $siteCode = $site.Properties['mSSMSSiteCode'][0]
+                    Write-Host "SCCM Site Code: $siteCode"
+                }
+                Write-Host " "
+            }
+            else {
+                Write-Host "No SCCM site code found."
+            }
+
+            # Part 3: Check System Management container ACL for computer accounts with Full Control
+            $systemManagementDN = "CN=System Management,CN=System,$BaseDN"
+            try {
+                $systemManagement = [adsi]"LDAP://$DC/$systemManagementDN"
+                $acl = $systemManagement.ObjectSecurity.Access
+            
+                $computerAccountsWithFullControl = @()
+            
+                foreach ($ace in $acl) {
+                    try {
+                        # Check if the ACE is for a computer account and has Full Control
+                        $identity = $ace.IdentityReference.Value
+                    
+                        # Check if it's a computer account (ends with $)
+                        if ($identity -like '*$') {
+                            # Check for Full Control permissions
+                            if ($ace.ActiveDirectoryRights -match 'GenericAll|WriteDacl|WriteOwner') {
+                                $computerAccountsWithFullControl += $identity
+                            }
+                        }
+                    }
+                    catch {
+                        continue
+                    }
+                }
+
+                if ($computerAccountsWithFullControl.Count -gt 0) {
+                    Write-Host "Potential SCCM Servers (Computer accounts with Full Control on System Management container):" -ForegroundColor Yellow
+                    foreach ($computer in $computerAccountsWithFullControl | Select-Object -Unique) {
+                        Write-Host "  - $computer" -ForegroundColor Red
+                    }
+                    Write-Host " "
+                }
+            }
+            catch {
+                Write-Host "System Management container not found or inaccessible: $_" -ForegroundColor Yellow
             }
         }
         catch {
