@@ -445,7 +445,7 @@ public class RpcDump
                         Write-Host "- [!] Vulnerable flag found: EDITF_ATTRIBUTESUBJECTALTNAME2 (Potential ESC6)" -ForegroundColor Yellow
                         Write-Host " "
                     }
-                    $CASecurity3 = certutil.exe -config "$caServer\$caName" -getreg "CA\InterfaceFlags" 2>&1 | Out-String
+                    #$CASecurity3 = certutil.exe -config "$caServer\$caName" -getreg "CA\InterfaceFlags" 2>&1 | Out-String
                     if ($CASecurity3 -like "*InterfaceFlags*REG_DWORD*10*") {
                         Write-Host "- [!] Vulnerable flag found: Encryption is not enforced for RPC requests (ESC11)" -ForegroundColor Yellow
                         Write-Host " "
