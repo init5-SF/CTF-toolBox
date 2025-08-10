@@ -1,6 +1,7 @@
 #- Made for HTB' CAPE path
 #- Don't forget to import PowerView.ps1 first
 
+
 try {
     $dom = (Get-Domain).name
 }
@@ -70,8 +71,7 @@ function Get-GPLinkStatus {
         }
     }
     return $null
-}
-Write-Host " "
+}Write-Host " "
 Write-Host "-------- Vulnerable GPOs Scan:" -ForegroundColor Green
 # Process each result
 $results | ForEach-Object {
