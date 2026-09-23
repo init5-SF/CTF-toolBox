@@ -1051,12 +1051,12 @@ public class RpcDump
         )
         $kerberoastableSearch = [adsisearcher]"(&(userAccountControl:1.2.840.113556.1.4.803:=512)(servicePrincipalName=*))"
         $kerberoastableSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
-        $kerberoastableSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "userPrincipalName", "distinguishedName"))
+        $kerberoastableSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "servicePrincipalName", "distinguishedName"))
         $kerberoastableUsers = $kerberoastableSearch.FindAll()
-
         Print-SectionHeader "Kerberoastable Users"
         foreach ($user in $kerberoastableUsers) {
-            Write-Host "Username: $($user.Properties['sAMAccountName'][0]), UPN: $($user.Properties['userPrincipalName'][0]), DN: $($user.Properties['distinguishedName'][0])"
+            $spns = $user.Properties['servicePrincipalName'] -join ' & '
+            Write-Host "Username: $($user.Properties['sAMAccountName'][0]), SPNs: $($spns.TrimEnd($spns[-1])), DN: $($user.Properties['distinguishedName'][0])"
         }
     }
 
