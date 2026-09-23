@@ -1056,7 +1056,7 @@ public class RpcDump
         Print-SectionHeader "Kerberoastable Users"
         foreach ($user in $kerberoastableUsers) {
             $spns = $user.Properties['servicePrincipalName'] -join ' & '
-            Write-Host "Username: $($user.Properties['sAMAccountName'][0]), SPNs: $($spns.TrimEnd($spns[-1])), DN: $($user.Properties['distinguishedName'][0])"
+            Write-Host "Username: $($user.Properties['sAMAccountName'][0]), SPNs: $spns, DN: $($user.Properties['distinguishedName'][0])"
         }
     }
 
