@@ -1594,6 +1594,9 @@ public class RpcDump
         $excludedEntities = 'NT AUTHORITY\SYSTEM', 'NT AUTHORITY\SELF', 'BUILTIN\Administrators', 'BUILTIN\Account Operators', 'S-1-5-32-548'
         $domainPrefixedEntities = 'Domain Admins', 'Enterprise Admins', 'exchange trusted subsystem', 'organization management', 'exchange windows permissions', 'Cert Publishers', 'Enterprise Key Admins', 'Key Admins'
 
+        # Well-known GUID for ms-DS-Allowed-To-Act-On-Behalf-Of-Other-Identity
+        $allowedToActGuid = [Guid]"3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"
+
         # Filter out MSA and GMSA accounts
         $computerSearch = [adsisearcher]"(&(objectClass=computer)(!(objectClass=msDS-ManagedServiceAccount))(!(objectClass=msDS-GroupManagedServiceAccount)))"
         $computerSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
@@ -1623,10 +1626,23 @@ public class RpcDump
                 # Check if the identity is in the excluded entities list
                 $isExcluded = $excludedEntities -contains $identity -or $domainPrefixedEntities -contains $identity.Split('\')[-1]
 
-                # Exclude Account Operators and other excluded entities
-                if ($ace.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteDacl|WriteProperty|WriteOwner|WriteAccountRestrictions|AllowedToAct' -and -not $isExcluded) {
+                $matchedRights = $null
+
+                # Check for the "normal" rights (GenericWrite, GenericAll, WriteDacl, WriteOwner, WriteAccountRestrictions, AllowedToAct)
+                if ($ace.ActiveDirectoryRights -match 'GenericWrite|GenericAll|WriteDacl|WriteOwner|WriteAccountRestrictions|AllowedToAct' -and -not $isExcluded) {
+                    $matchedRights = $ace.ActiveDirectoryRights
+                }
+                # Check for WriteProperty ONLY if it applies to the ms-DS-Allowed-To-Act-On-Behalf-Of-Other-Identity attribute
+                elseif (($ace.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty) -and -not $isExcluded) {
+                    # ObjectType must match the well-known GUID for ms-DS-Allowed-To-Act-On-Behalf-Of-Other-Identity
+                    if ($ace.ObjectType -eq $allowedToActGuid) {
+                        $matchedRights = "WriteProperty (ms-DS-Allowed-To-Act-On-Behalf-Of-Other-Identity)"
+                    }
+                }
+
+                if ($matchedRights) {
                     if (-not $permissions.ContainsKey($identity)) { $permissions[$identity] = @() }
-                    $permissions[$identity] += $ace.ActiveDirectoryRights
+                    $permissions[$identity] += $matchedRights
                 }
             }
 
@@ -1634,13 +1650,71 @@ public class RpcDump
                 Write-Host "[!] Computer object:" 
                 Write-Host "$($computer.Properties["name"][0])" -ForegroundColor Yellow
                 Write-Host "[!] Users with permissions:" 
-                #foreach ($user in $permissions.Keys) { Write-Host "$user -> $($permissions[$user] -join ', ')" -ForegroundColor Yellow }
                 foreach ($user in $permissions.Keys) { Write-Host "$user -> $(($permissions[$user] | Select-Object -Unique) -join ', ')" -ForegroundColor Yellow }
 
                 Write-Host " "
             }
         }
     }
+
+    function Find-ActualRBCD {
+        param (
+            [System.DirectoryServices.DirectoryEntry]$Connection,
+            [string]$BaseDN
+        )
+
+        Print-SectionHeader "Actual RBCD"
+
+        # Search for computer objects that have the msDS-AllowedToActOnBehalfOfOtherIdentity attribute populated
+        $rbcdSearch = [adsisearcher]"(&(objectClass=computer)(msDS-AllowedToActOnBehalfOfOtherIdentity=*)(!(objectClass=msDS-ManagedServiceAccount))(!(objectClass=msDS-GroupManagedServiceAccount)))"
+        $rbcdSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+        $rbcdSearch.PropertiesToLoad.AddRange(@("name", "distinguishedName", "msDS-AllowedToActOnBehalfOfOtherIdentity"))
+        $rbcdComputers = $rbcdSearch.FindAll()
+
+        if ($rbcdComputers.Count -eq 0) {
+            Write-Host "No computers found with RBCD configured."
+            return
+        }
+
+        foreach ($computer in $rbcdComputers) {
+            $computerName = $computer.Properties['name'][0]
+            $computerDN = $computer.Properties['distinguishedName'][0]
+
+            Write-Host "[!] Computer object:"
+            Write-Host "$computerName" -ForegroundColor Yellow
+            #Write-Host "DN: $computerDN" -ForegroundColor Yellow
+
+            # Parse the security descriptor to extract the principals
+            $sdBytes = $computer.Properties['msDS-AllowedToActOnBehalfOfOtherIdentity'][0]
+            try {
+                $sd = New-Object System.DirectoryServices.ActiveDirectorySecurity
+                $sd.SetSecurityDescriptorBinaryForm($sdBytes)
+
+                $principals = @()
+                foreach ($rule in $sd.GetAccessRules($true, $true, [System.Security.Principal.NTAccount])) {
+                    if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) {
+                        $principals += $rule.IdentityReference.Value
+                    }
+                }
+
+                if ($principals.Count -gt 0) {
+                    Write-Host "[!] PrincipalsAllowedToDelegateToAccount:"
+                    foreach ($principal in $principals) {
+                        Write-Host "  - $principal" -ForegroundColor Red
+                    }
+                }
+                else {
+                    Write-Host "PrincipalsAllowedToDelegateToAccount: [No principals parsed]" -ForegroundColor Yellow
+                }
+            }
+            catch {
+                Write-Host "PrincipalsAllowedToDelegateToAccount: [Error parsing security descriptor: $_]" -ForegroundColor Red
+            }
+
+            Write-Host " "
+        }
+    }
+
     # Main script execution
     try {
         # Extract domain name from the provided username
@@ -1693,6 +1767,7 @@ public class RpcDump
         List-Users -Connection $connection -BaseDN $baseDN
         List-Computers -Connection $connection -BaseDN $baseDN
         Find-PossibleRBCD -Connection $connection -BaseDN $baseDN
+        Find-ActualRBCD -Connection $connection -BaseDN $baseDN
         Check-PotentialPrinterBug -Connection $connection -BaseDN $baseDN
         Invoke-RpcDumpCheck -Connection $connection -BaseDN $baseDN
         List-ManagedServiceAccounts -Connection $connection -BaseDN $baseDN
