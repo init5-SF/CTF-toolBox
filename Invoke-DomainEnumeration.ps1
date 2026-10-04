@@ -1715,6 +1715,57 @@ public class RpcDump
         }
     }
 
+    function List-SQLServices {
+        param (
+            [System.DirectoryServices.DirectoryEntry]$Connection,
+            [string]$BaseDN
+        )
+
+        Print-SectionHeader "SQL Services"
+
+        # Search for any object (user or computer) with an SPN starting with MSSQLSvc
+        $sqlSearch = [adsisearcher]"(&(|(objectClass=user)(objectClass=computer))(servicePrincipalName=MSSQLSvc*))"
+        $sqlSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+        $sqlSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "distinguishedName", "servicePrincipalName", "objectClass"))
+        $sqlObjects = $sqlSearch.FindAll()
+
+        if ($sqlObjects.Count -eq 0) {
+            Write-Host "No SQL Service SPNs (MSSQLSvc*) found."
+            return
+        }
+
+        foreach ($obj in $sqlObjects) {
+            $samAccountName = $obj.Properties['sAMAccountName'][0]
+            $dn = $obj.Properties['distinguishedName'][0]
+            $objectClass = $obj.Properties['objectClass']
+
+            # Determine whether this is a user or computer account
+            if ($objectClass -contains "computer") {
+                $accountType = "Computer"
+            }
+            elseif ($objectClass -contains "user") {
+                $accountType = "User"
+            }
+            else {
+                $accountType = "Unknown"
+            }
+
+            # Filter to only MSSQLSvc SPNs (in case of wildcard matching quirks)
+            $sqlSpns = $obj.Properties['servicePrincipalName'] | Where-Object { $_ -like "MSSQLSvc*" }
+
+            if ($sqlSpns.Count -gt 0) {
+                Write-Host "Account Type: $accountType" -ForegroundColor Yellow
+                Write-Host "SAM Account Name: $samAccountName" -ForegroundColor Green
+                Write-Host "DN: $dn"
+                Write-Host "MSSQLSvc SPNs:"
+                foreach ($spn in $sqlSpns) {
+                    Write-Host "  - $spn" -ForegroundColor Red
+                }
+                Write-Host " "
+            }
+        }
+    }
+
     # Main script execution
     try {
         # Extract domain name from the provided username
@@ -1768,6 +1819,7 @@ public class RpcDump
         List-Computers -Connection $connection -BaseDN $baseDN
         Find-PossibleRBCD -Connection $connection -BaseDN $baseDN
         Find-ActualRBCD -Connection $connection -BaseDN $baseDN
+        List-SQLServices -Connection $connection -BaseDN $baseDN
         Check-PotentialPrinterBug -Connection $connection -BaseDN $baseDN
         Invoke-RpcDumpCheck -Connection $connection -BaseDN $baseDN
         List-ManagedServiceAccounts -Connection $connection -BaseDN $baseDN
