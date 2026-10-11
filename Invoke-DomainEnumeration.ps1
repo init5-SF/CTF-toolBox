@@ -1045,20 +1045,102 @@ public class RpcDump
     }
 
     function List-KerberoastableUsers {
-        param (
-            [System.DirectoryServices.DirectoryEntry]$Connection,
-            [string]$BaseDN
-        )
-        $kerberoastableSearch = [adsisearcher]"(&(userAccountControl:1.2.840.113556.1.4.803:=512)(servicePrincipalName=*))"
-        $kerberoastableSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
-        $kerberoastableSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "servicePrincipalName", "distinguishedName"))
-        $kerberoastableUsers = $kerberoastableSearch.FindAll()
-        Print-SectionHeader "Kerberoastable Users"
-        foreach ($user in $kerberoastableUsers) {
-            $spns = $user.Properties['servicePrincipalName'] -join ' & '
-            Write-Host "Username: $($user.Properties['sAMAccountName'][0]), SPNs: $spns, DN: $($user.Properties['distinguishedName'][0])"
+    param (
+        [System.DirectoryServices.DirectoryEntry]$Connection,
+        [string]$BaseDN
+    )
+
+    # Build a lookup of all known computer hostnames (FQDN + short name)
+    # so we can detect orphaned SPNs.
+    $knownHosts = @{}
+
+    $computerSearch = [adsisearcher]"(&(objectClass=computer))"
+    $computerSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+    $computerSearch.PropertiesToLoad.AddRange(@("dNSHostName", "sAMAccountName", "servicePrincipalName"))
+    $computerResults = $computerSearch.FindAll()
+
+    foreach ($computer in $computerResults) {
+        # dNSHostName (FQDN)
+        if ($computer.Properties['dNSHostName'] -and $computer.Properties['dNSHostName'][0]) {
+            $fqdn = $computer.Properties['dNSHostName'][0]
+            $knownHosts[$fqdn.ToLower()] = $true
+            # Also store the short name (first label before the dot)
+            $shortName = $fqdn.Split('.')[0]
+            $knownHosts[$shortName.ToLower()] = $true
+        }
+
+        # sAMAccountName (typically "HOSTNAME$")
+        if ($computer.Properties['sAMAccountName'] -and $computer.Properties['sAMAccountName'][0]) {
+            $sam = $computer.Properties['sAMAccountName'][0].TrimEnd('$')
+            $knownHosts[$sam.ToLower()] = $true
+        }
+
+        # Host portions from any existing SPNs on the computer
+        if ($computer.Properties['servicePrincipalName']) {
+            foreach ($spn in $computer.Properties['servicePrincipalName']) {
+                if ($spn -match "^[^/]+/([^/:]+)") {
+                    $knownHosts[$matches[1].ToLower()] = $true
+                }
+            }
         }
     }
+
+    $kerberoastableSearch = [adsisearcher]"(&(userAccountControl:1.2.840.113556.1.4.803:=512)(servicePrincipalName=*))"
+    $kerberoastableSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+    $kerberoastableSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "servicePrincipalName", "distinguishedName"))
+    $kerberoastableUsers = $kerberoastableSearch.FindAll()
+
+    Print-SectionHeader "Kerberoastable Users"
+    foreach ($user in $kerberoastableUsers) {
+        $samAccountName = $user.Properties['sAMAccountName'][0]
+
+        # Exempt the krbtgt account
+        if ($samAccountName -ieq 'krbtgt') {
+            continue
+        }
+
+        Write-Host "Username: $samAccountName"
+        Write-Host "DN: $($user.Properties['distinguishedName'][0])"
+        Write-Host "SPNs:"
+
+        foreach ($spn in $user.Properties['servicePrincipalName']) {
+            if ([string]::IsNullOrEmpty($spn)) { continue }
+
+            # Extract the host portion from the SPN (service/host[:port])
+            $hostPart = $null
+            if ($spn -match "^[^/]+/([^/:]+)") {
+                $hostPart = $matches[1]
+            }
+
+            $isOrphaned = $true
+            if ($hostPart) {
+                $hostLower = $hostPart.ToLower()
+                if ($knownHosts.ContainsKey($hostLower)) {
+                    $isOrphaned = $false
+                }
+                else {
+                    # If FQDN, also try the short name (and vice versa)
+                    $shortName = $hostLower.Split('.')[0]
+                    if ($knownHosts.ContainsKey($shortName)) {
+                        $isOrphaned = $false
+                    }
+                }
+            }
+            else {
+                # SPN has no host portion — treat as orphaned/unknown
+                $isOrphaned = $true
+            }
+
+            if ($isOrphaned) {
+                Write-Host "  - $spn [ORPHANED]" -ForegroundColor Red
+            }
+            else {
+                Write-Host "  - $spn" -ForegroundColor Green
+            }
+        }
+        Write-Host " "
+    }
+}
 
     function List-ASREPRoastableUsers {
         param (
