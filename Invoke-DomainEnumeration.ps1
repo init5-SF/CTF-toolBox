@@ -169,7 +169,120 @@ public class RpcDump
 
         Print-SectionHeader "GPO Enumeration"
 
-        # First, get all GPOs in the domain and store them in a hashtable for quick lookup
+        # ---------------------------------------------------------------
+        # 1. Build a SID -> Name lookup table for the whole domain
+        # ---------------------------------------------------------------
+        $sidMap = @{}
+
+        # Well-known / builtin SIDs we want to resolve without LDAP
+        $wellKnownSids = @{
+            'S-1-5-32-544' = 'BUILTIN\Administrators'
+            'S-1-5-32-545' = 'BUILTIN\Users'
+            'S-1-5-32-546' = 'BUILTIN\Guests'
+            'S-1-5-32-547' = 'BUILTIN\Power Users'
+            'S-1-5-32-548' = 'BUILTIN\Account Operators'
+            'S-1-5-32-549' = 'BUILTIN\Server Operators'
+            'S-1-5-32-550' = 'BUILTIN\Print Operators'
+            'S-1-5-32-551' = 'BUILTIN\Backup Operators'
+            'S-1-5-32-552' = 'BUILTIN\Replicator'
+            'S-1-5-32-554' = 'BUILTIN\Pre-Windows 2000 Compatible Access'
+            'S-1-5-32-555' = 'BUILTIN\Remote Desktop Users'
+            'S-1-5-32-556' = 'BUILTIN\Network Configuration Operators'
+            'S-1-5-32-557' = 'BUILTIN\Incoming Forest Trust Builders'
+            'S-1-5-32-558' = 'BUILTIN\Performance Monitor Users'
+            'S-1-5-32-559' = 'BUILTIN\Performance Log Users'
+            'S-1-5-32-560' = 'BUILTIN\Windows Authorization Access Group'
+            'S-1-5-32-561' = 'BUILTIN\Terminal Server License Servers'
+            'S-1-5-32-562' = 'BUILTIN\Distributed COM Users'
+            'S-1-5-32-568' = 'BUILTIN\IIS_IUSRS'
+            'S-1-5-32-569' = 'BUILTIN\Cryptographic Operators'
+            'S-1-5-32-573' = 'BUILTIN\Event Log Readers'
+            'S-1-5-32-574' = 'BUILTIN\Certificate Service DCOM Access'
+            'S-1-5-32-575' = 'BUILTIN\RDS Remote Access Servers'
+            'S-1-5-32-576' = 'BUILTIN\RDS Endpoint Servers'
+            'S-1-5-32-577' = 'BUILTIN\RDS Management Servers'
+            'S-1-5-32-578' = 'BUILTIN\Hyper-V Administrators'
+            'S-1-5-32-579' = 'BUILTIN\Access Control Assistance Operators'
+            'S-1-5-32-580' = 'BUILTIN\Remote Management Users'
+            'S-1-5-11'     = 'NT AUTHORITY\Authenticated Users'
+            'S-1-5-4'      = 'NT AUTHORITY\INTERACTIVE'
+            'S-1-5-7'      = 'NT AUTHORITY\ANONYMOUS LOGON'
+            'S-1-5-18'     = 'NT AUTHORITY\SYSTEM'
+            'S-1-5-19'     = 'NT AUTHORITY\LOCAL SERVICE'
+            'S-1-5-20'     = 'NT AUTHORITY\NETWORK SERVICE'
+            'S-1-1-0'      = 'Everyone'
+            'S-1-5-10'     = 'NT AUTHORITY\SELF'
+        }
+        foreach ($k in $wellKnownSids.Keys) { $sidMap[$k] = $wellKnownSids[$k] }
+
+        # Enumerate all objects that have an objectSid (users, groups, computers)
+        $sidSearcher = New-Object System.DirectoryServices.DirectorySearcher($Connection)
+        $sidSearcher.Filter = "(objectSid=*)"
+        $sidSearcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+        $sidSearcher.PageSize = 1000
+        $sidSearcher.PropertiesToLoad.AddRange(@("objectSid", "sAMAccountName", "name", "objectClass", "distinguishedName")) | Out-Null
+
+        # Also grab the domain SID for NetBIOS prefix
+        $domainNetBIOS = ($BaseDN -replace 'DC=', '' -replace ',', '.').Split('.')[0].ToUpper()
+
+        try {
+            $sidResults = $sidSearcher.FindAll()
+            foreach ($r in $sidResults) {
+                try {
+                    if (-not $r.Properties['objectSid'] -or $r.Properties['objectSid'].Count -eq 0) { continue }
+                    $sidObj = New-Object System.Security.Principal.SecurityIdentifier($r.Properties['objectSid'][0], 0)
+                    $sidString = $sidObj.Value
+
+                    $name = $null
+                    if ($r.Properties['sAMAccountName'] -and $r.Properties['sAMAccountName'].Count -gt 0) {
+                        $name = $r.Properties['sAMAccountName'][0]
+                    }
+                    elseif ($r.Properties['name'] -and $r.Properties['name'].Count -gt 0) {
+                        $name = $r.Properties['name'][0]
+                    }
+
+                    if ($name) {
+                        # Prefer DOMAIN\name format for domain objects
+                        if ($r.Properties['objectClass'] -contains 'group' -or $r.Properties['objectClass'] -contains 'user' -or $r.Properties['objectClass'] -contains 'computer') {
+                            # If it's already a builtin (S-1-5-32-*), keep the BUILTIN prefix
+                            if ($sidString -like 'S-1-5-32-*') {
+                                $sidMap[$sidString] = "BUILTIN\$name"
+                            }
+                            else {
+                                $sidMap[$sidString] = "$domainNetBIOS\$name"
+                            }
+                        }
+                        else {
+                            $sidMap[$sidString] = $name
+                        }
+                    }
+                }
+                catch { }
+            }
+            $sidResults.Dispose()
+        }
+        catch {
+            Write-Host "[!] Warning: could not fully build SID map: $_" -ForegroundColor Yellow
+        }
+
+        # Fallback resolver: try .NET translation, then SID map, then raw SID
+        function Resolve-SID {
+            param([string]$SID)
+            if ([string]::IsNullOrEmpty($SID)) { return $SID }
+            $SID = $SID.Trim()
+            if ($sidMap.ContainsKey($SID)) { return $sidMap[$SID] }
+            try {
+                $sidObj = New-Object System.Security.Principal.SecurityIdentifier($SID)
+                $acct = $sidObj.Translate([System.Security.Principal.NTAccount])
+                return $acct.Value
+            }
+            catch { }
+            return $SID
+        }
+
+        # ---------------------------------------------------------------
+        # 2. Build GPO GUID -> {Name, FileSysPath} map
+        # ---------------------------------------------------------------
         $gpoSearch = [adsisearcher]"(&(objectClass=groupPolicyContainer))"
         $gpoSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
         $gpoSearch.PropertiesToLoad.AddRange(@("displayName", "cn", "gPCFileSysPath"))
@@ -180,15 +293,94 @@ public class RpcDump
             return
         }
 
-        # Create a hashtable to map GPO GUIDs (with curly braces) to their display names
         $gpoMap = @{}
         foreach ($gpo in $gpos) {
-            $gpoGuid = $gpo.Properties['cn'][0]  # The GUID is stored in the 'cn' attribute (with curly braces)
+            $gpoGuid = $gpo.Properties['cn'][0]
             $gpoName = $gpo.Properties['displayName'][0]
-            $gpoMap[$gpoGuid] = $gpoName
+            $gpoFileSysPath = if ($gpo.Properties['gPCFileSysPath']) { $gpo.Properties['gPCFileSysPath'][0] } else { $null }
+            $gpoMap[$gpoGuid] = @{
+                Name        = $gpoName
+                FileSysPath = $gpoFileSysPath
+            }
         }
 
-        # Now, search for all objects (OUs, domains, and containers) that have the gPLink attribute
+        # ---------------------------------------------------------------
+        # 3. Parse GptTmpl.inf for [Group Membership] entries
+        # ---------------------------------------------------------------
+        function Get-RestrictedGroupsFromGPO {
+            param([string]$GPOFilePath)
+
+            $restrictedGroups = @()
+            if ([string]::IsNullOrEmpty($GPOFilePath)) { return $restrictedGroups }
+
+            # gPCFileSysPath looks like: \\domain.local\SYSVOL\domain.local\Policies\{GUID}
+            # We can also try the local path version if running on a DC
+            $candidatePaths = @(
+                (Join-Path $GPOFilePath "Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf")
+            )
+
+            # Also attempt to translate the UNC path to a local path (strip \\server\share\)
+            if ($GPOFilePath -match '^\\\\([^\\]+)\\([^\\]+)\\(.+)$') {
+                $localPath = "\\$($matches[2])\$($matches[3])"
+                $candidatePaths += (Join-Path $localPath "Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf")
+            }
+
+            $content = $null
+            foreach ($p in $candidatePaths) {
+                try {
+                    if (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) {
+                        $content = Get-Content -LiteralPath $p -Raw -ErrorAction SilentlyContinue
+                        if (-not [string]::IsNullOrEmpty($content)) { break }
+                    }
+                }
+                catch { }
+            }
+
+            if ([string]::IsNullOrEmpty($content)) { return $restrictedGroups }
+
+            $inGroupMembership = $false
+            $lines = $content -split "`r?`n"
+
+            foreach ($line in $lines) {
+                $trimmedLine = $line.Trim()
+
+                # Section header?
+                if ($trimmedLine -match '^\[(.+)\]$') {
+                    $inGroupMembership = ($matches[1].Trim() -eq 'Group Membership')
+                    continue
+                }
+
+                if (-not $inGroupMembership) { continue }
+
+                # Pattern: *SID__Memberof = *SID1*SID2...
+                # Note: leading '*' is part of the SID syntax in these INF files
+                if ($trimmedLine -match '^\*([^_]+)__Memberof\s*=\s*(.+)$') {
+                    $groupSID = $matches[1].Trim()
+                    $memberOfRaw = $matches[2].Trim()
+
+                    $groupName = Resolve-SID -SID $groupSID
+
+                    # Split on '*' and drop empties
+                    $memberOfSIDs = $memberOfRaw -split '\*' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+                    foreach ($mSid in $memberOfSIDs) {
+                        $mSid = $mSid.Trim()
+                        if ([string]::IsNullOrEmpty($mSid)) { continue }
+                        $targetGroupName = Resolve-SID -SID $mSid
+                        $restrictedGroups += @{
+                            Group    = $groupName
+                            MemberOf = $targetGroupName
+                        }
+                    }
+                }
+            }
+
+            return $restrictedGroups
+        }
+
+        # ---------------------------------------------------------------
+        # 4. Enumerate GPO links and display
+        # ---------------------------------------------------------------
         $gpoLinkSearch = [adsisearcher]"(gPLink=*)"
         $gpoLinkSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
         $gpoLinkSearch.PropertiesToLoad.AddRange(@("distinguishedName", "gPLink"))
@@ -199,24 +391,28 @@ public class RpcDump
             return
         }
 
-        # Parse the gPLink attribute for each object
         foreach ($gpoLink in $gpoLinks) {
             $objectDN = $gpoLink.Properties['distinguishedName'][0]
             $gpoLinkValue = $gpoLink.Properties['gPLink'][0]
 
             Write-Host "Linked to: $objectDN" -ForegroundColor Yellow
 
-            # Parse the gPLink value to extract GPO GUIDs (with curly braces)
-            $gpoGuids = $gpoLinkValue -split '\]\[' | ForEach-Object {
-                if ($_ -match '\{([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}') {
-                    "{$($matches[1])}"  # Extract the GPO GUID and wrap it in curly braces
-                }
-            }
+            # Extract each [LDAP://cn={GUID};flags] block
+            $gpoGuids = [regex]::Matches($gpoLinkValue, '\{([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}') |
+            ForEach-Object { "{$($_.Groups[1].Value)}" }
 
-            # Display the GPOs linked to this object
             foreach ($gpoGuid in $gpoGuids) {
                 if ($gpoMap.ContainsKey($gpoGuid)) {
-                    Write-Host "  - GPO: $($gpoMap[$gpoGuid]) (GUID: $gpoGuid)" -ForegroundColor Green
+                    $gpoInfo = $gpoMap[$gpoGuid]
+                    Write-Host "  - GPO: $($gpoInfo.Name) (GUID: $gpoGuid)" -ForegroundColor Green
+
+                    $restrictedGroups = Get-RestrictedGroupsFromGPO -GPOFilePath $gpoInfo.FileSysPath
+
+                    if ($restrictedGroups.Count -gt 0) {
+                        foreach ($rg in $restrictedGroups) {
+                            Write-Host "   |_Restricted Groups found: $($rg.Group) -> $($rg.MemberOf)" -ForegroundColor Red
+                        }
+                    }
                 }
                 else {
                     Write-Host "  - GPO: [Unknown] (GUID: $gpoGuid)" -ForegroundColor Red
@@ -226,7 +422,6 @@ public class RpcDump
             Write-Host " "
         }
     }
-
     function Get-DomainInfo {
         param (
             [System.DirectoryServices.DirectoryEntry]$Connection,
@@ -1045,102 +1240,102 @@ public class RpcDump
     }
 
     function List-KerberoastableUsers {
-    param (
-        [System.DirectoryServices.DirectoryEntry]$Connection,
-        [string]$BaseDN
-    )
+        param (
+            [System.DirectoryServices.DirectoryEntry]$Connection,
+            [string]$BaseDN
+        )
 
-    # Build a lookup of all known computer hostnames (FQDN + short name)
-    # so we can detect orphaned SPNs.
-    $knownHosts = @{}
+        # Build a lookup of all known computer hostnames (FQDN + short name)
+        # so we can detect orphaned SPNs.
+        $knownHosts = @{}
 
-    $computerSearch = [adsisearcher]"(&(objectClass=computer))"
-    $computerSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
-    $computerSearch.PropertiesToLoad.AddRange(@("dNSHostName", "sAMAccountName", "servicePrincipalName"))
-    $computerResults = $computerSearch.FindAll()
+        $computerSearch = [adsisearcher]"(&(objectClass=computer))"
+        $computerSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+        $computerSearch.PropertiesToLoad.AddRange(@("dNSHostName", "sAMAccountName", "servicePrincipalName"))
+        $computerResults = $computerSearch.FindAll()
 
-    foreach ($computer in $computerResults) {
-        # dNSHostName (FQDN)
-        if ($computer.Properties['dNSHostName'] -and $computer.Properties['dNSHostName'][0]) {
-            $fqdn = $computer.Properties['dNSHostName'][0]
-            $knownHosts[$fqdn.ToLower()] = $true
-            # Also store the short name (first label before the dot)
-            $shortName = $fqdn.Split('.')[0]
-            $knownHosts[$shortName.ToLower()] = $true
-        }
-
-        # sAMAccountName (typically "HOSTNAME$")
-        if ($computer.Properties['sAMAccountName'] -and $computer.Properties['sAMAccountName'][0]) {
-            $sam = $computer.Properties['sAMAccountName'][0].TrimEnd('$')
-            $knownHosts[$sam.ToLower()] = $true
-        }
-
-        # Host portions from any existing SPNs on the computer
-        if ($computer.Properties['servicePrincipalName']) {
-            foreach ($spn in $computer.Properties['servicePrincipalName']) {
-                if ($spn -match "^[^/]+/([^/:]+)") {
-                    $knownHosts[$matches[1].ToLower()] = $true
-                }
-            }
-        }
-    }
-
-    $kerberoastableSearch = [adsisearcher]"(&(userAccountControl:1.2.840.113556.1.4.803:=512)(servicePrincipalName=*))"
-    $kerberoastableSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
-    $kerberoastableSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "servicePrincipalName", "distinguishedName"))
-    $kerberoastableUsers = $kerberoastableSearch.FindAll()
-
-    Print-SectionHeader "Kerberoastable Users"
-    foreach ($user in $kerberoastableUsers) {
-        $samAccountName = $user.Properties['sAMAccountName'][0]
-
-        # Exempt the krbtgt account
-        if ($samAccountName -ieq 'krbtgt') {
-            continue
-        }
-
-        Write-Host "Username: $samAccountName"
-        Write-Host "DN: $($user.Properties['distinguishedName'][0])"
-        Write-Host "SPNs:"
-
-        foreach ($spn in $user.Properties['servicePrincipalName']) {
-            if ([string]::IsNullOrEmpty($spn)) { continue }
-
-            # Extract the host portion from the SPN (service/host[:port])
-            $hostPart = $null
-            if ($spn -match "^[^/]+/([^/:]+)") {
-                $hostPart = $matches[1]
+        foreach ($computer in $computerResults) {
+            # dNSHostName (FQDN)
+            if ($computer.Properties['dNSHostName'] -and $computer.Properties['dNSHostName'][0]) {
+                $fqdn = $computer.Properties['dNSHostName'][0]
+                $knownHosts[$fqdn.ToLower()] = $true
+                # Also store the short name (first label before the dot)
+                $shortName = $fqdn.Split('.')[0]
+                $knownHosts[$shortName.ToLower()] = $true
             }
 
-            $isOrphaned = $true
-            if ($hostPart) {
-                $hostLower = $hostPart.ToLower()
-                if ($knownHosts.ContainsKey($hostLower)) {
-                    $isOrphaned = $false
-                }
-                else {
-                    # If FQDN, also try the short name (and vice versa)
-                    $shortName = $hostLower.Split('.')[0]
-                    if ($knownHosts.ContainsKey($shortName)) {
-                        $isOrphaned = $false
+            # sAMAccountName (typically "HOSTNAME$")
+            if ($computer.Properties['sAMAccountName'] -and $computer.Properties['sAMAccountName'][0]) {
+                $sam = $computer.Properties['sAMAccountName'][0].TrimEnd('$')
+                $knownHosts[$sam.ToLower()] = $true
+            }
+
+            # Host portions from any existing SPNs on the computer
+            if ($computer.Properties['servicePrincipalName']) {
+                foreach ($spn in $computer.Properties['servicePrincipalName']) {
+                    if ($spn -match "^[^/]+/([^/:]+)") {
+                        $knownHosts[$matches[1].ToLower()] = $true
                     }
                 }
             }
-            else {
-                # SPN has no host portion — treat as orphaned/unknown
-                $isOrphaned = $true
+        }
+
+        $kerberoastableSearch = [adsisearcher]"(&(userAccountControl:1.2.840.113556.1.4.803:=512)(servicePrincipalName=*))"
+        $kerberoastableSearch.SearchRoot = [adsi]"LDAP://$DC/$BaseDN"
+        $kerberoastableSearch.PropertiesToLoad.AddRange(@("sAMAccountName", "servicePrincipalName", "distinguishedName"))
+        $kerberoastableUsers = $kerberoastableSearch.FindAll()
+
+        Print-SectionHeader "Kerberoastable Users"
+        foreach ($user in $kerberoastableUsers) {
+            $samAccountName = $user.Properties['sAMAccountName'][0]
+
+            # Exempt the krbtgt account
+            if ($samAccountName -ieq 'krbtgt') {
+                continue
             }
 
-            if ($isOrphaned) {
-                Write-Host "  - $spn [ORPHANED]" -ForegroundColor Red
+            Write-Host "Username: $samAccountName"
+            Write-Host "DN: $($user.Properties['distinguishedName'][0])"
+            Write-Host "SPNs:"
+
+            foreach ($spn in $user.Properties['servicePrincipalName']) {
+                if ([string]::IsNullOrEmpty($spn)) { continue }
+
+                # Extract the host portion from the SPN (service/host[:port])
+                $hostPart = $null
+                if ($spn -match "^[^/]+/([^/:]+)") {
+                    $hostPart = $matches[1]
+                }
+
+                $isOrphaned = $true
+                if ($hostPart) {
+                    $hostLower = $hostPart.ToLower()
+                    if ($knownHosts.ContainsKey($hostLower)) {
+                        $isOrphaned = $false
+                    }
+                    else {
+                        # If FQDN, also try the short name (and vice versa)
+                        $shortName = $hostLower.Split('.')[0]
+                        if ($knownHosts.ContainsKey($shortName)) {
+                            $isOrphaned = $false
+                        }
+                    }
+                }
+                else {
+                    # SPN has no host portion — treat as orphaned/unknown
+                    $isOrphaned = $true
+                }
+
+                if ($isOrphaned) {
+                    Write-Host "  - $spn [ORPHANED]" -ForegroundColor Red
+                }
+                else {
+                    Write-Host "  - $spn" -ForegroundColor Green
+                }
             }
-            else {
-                Write-Host "  - $spn" -ForegroundColor Green
-            }
+            Write-Host " "
         }
-        Write-Host " "
     }
-}
 
     function List-ASREPRoastableUsers {
         param (
